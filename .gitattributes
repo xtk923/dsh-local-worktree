@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# Line endings
+#
+# Every file in this repository is LF (no BOM). No `core.autocrlf` is set on the
+# development machine, which means a Windows checkout with `autocrlf=true` would
+# otherwise silently rewrite every file to CRLF and turn a one-line change into a
+# whole-file diff. `text=auto eol=lf` keeps the working tree LF on every platform.
+#
+# This matters beyond tidiness: the plugin builds shell-free argv and ships as
+# plain JavaScript, and DSH plugin bundles are compared by content.
+# ---------------------------------------------------------------------------
+* text=auto eol=lf
+
+# Binary assets must never be line-ending converted.
+*.svg text
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+
+# Git's own files are always LF, whatever the platform setting says.
+*.sh text eol=lf
+*.bash text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+
+# Test fixtures: expected git output is compared literally, so it must not be
+# normalised into a different shape than git produced.
+test/** text eol=lf

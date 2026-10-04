@@ -1,0 +1,206 @@
+# dsh-local-worktree
+
+A one-click git worktree inside DeepSeek Harness. In a git workspace a button
+appears in the composer toolbar: press it to cut an isolated worktree beside the
+repository, do the work there, then press it again to merge that work back into
+the branch it came from.
+
+**Everything is local git.** No remote, no bundle, no GitHub, no network. A
+linked worktree shares the repository's object database, so commits made in it
+are already reachable from the main tree — "deliver" is a plain local branch
+merge, nothing more.
+
+```
+ ┌────────────────────────┐   create    ┌───────────────────────────────────────┐
+ │  C:\proj\app           │ ──────────► │  C:\proj\app_worktrees\app_a4f9m3k8   │
+ │  branch: main          │             │  branch: dsh/wt/app_a4f9m3k8          │
+ │  (your working copy)   │ ◄────────── │  (the session works here)             │
+ └────────────────────────┘   deliver   └───────────────────────────────────────┘
+```
+
+Every click mints a **new** `app_<timestamp+random>` directory, so two clicks are
+two worktrees rather than one reused one.
+
+## What the button does
+
+The control lives in **one** seat — `conversation.input.left`, the composer
+toolbar — and the state it renders is decided by the session's working directory:
+
+* that slot is **ambient**, so it exists *before the first message*, which is what
+  makes it possible to **start** a session in a worktree rather than retrofit one
+  afterwards;
+* it is present in **every** session, which the session header is not.
+
+One seat is a deliberate constraint. A slot that hosts the same component twice
+mounts it twice with two independent copies of its state, so every message the
+control shows appears twice on screen — this plugin did exactly that, in the
+composer toolbar and the session header at once.
+
+| Where the session is | What the control offers |
+|---|---|
+| **no working directory yet** (blank-session Hero) | **用 worktree 开工** — opens a picker of your known git repositories; picking one cuts a worktree, opens a session rooted in it, and **switches the browser to that session** |
+| not a git repository | nothing at all — the control does not render |
+| a repository with no commit yet | a disabled button explaining that you must commit once first |
+| a repository on a branch | **创建 worktree** — cut a new worktree and start a session in it |
+| inside a worktree it created | **合并回 &lt;branch&gt; · N** — merge the N new commits back |
+
+Creating is **always** available in a usable repository: each worktree gets its
+own `<repo>_<id>` path and its own branch, so a second click is a second worktree
+rather than a collision. Worktrees this plugin made are listed in the `⋯` menu so
+you can jump back to their session; worktrees it did **not** make — including
+DSH's own managed checkouts under `~/.dsh/worktrees/`, and any you created by
+hand — are deliberately not reported and never disable anything here.
+
+The picker lists non-git workspaces too, greyed with the reason: a menu that
+silently omits the directory you just picked is worse than one that says why.
+
+Navigation uses the shipped client service **`uiWorkspace.openSession(id)`** —
+the same call the sidebar's own "New session" button and every session-row click
+make. Creating a Session on the Host only adds a sidebar row: a session that
+appears out of band is merged into the list and nothing more, which is exactly
+why a user had to go and find it. If the service is ever missing, the worktree is
+still created and the control says where to find the session.
+
+A `⋯` menu beside it carries the secondary actions: create, deliver, open that
+worktree's session, open the folder in the file manager, start in *another*
+repository, and discard the worktree.
+
+## What "deliver" guarantees
+
+1. **Nothing is decided after something is written.** Every refusal — a dirty
+   main tree, the main tree having moved to another branch, a different
+   repository, an unfinished merge — is decided by reading state first.
+2. **A conflict is detected before it happens.** When the base branch has moved,
+   `git merge-tree --write-tree` computes the merge *without touching the working
+   tree, the index or HEAD*. A conflict is reported with the file names, and
+   nothing was ever started.
+3. **If a conflict does land anyway** (an older git without `merge-tree
+   --write-tree`), the only recovery this plugin performs is `git merge --abort`,
+   which restores the pre-merge index and working tree exactly. The worktree is
+   always kept, so a conflict costs a retry — never the work.
+4. **The worktree's own branch is deleted with `git branch -d`, never `-D`.** If
+   its commits are not merged, git refuses and the branch survives.
+
+## What it will not do
+
+* **Never touches a remote.** No `fetch`, no `push`, no `remote add`. There is a
+  test that asserts `git remote -v` is empty and no `remote.*` config exists
+  after a full create → work → deliver cycle.
+* **Never skips your hooks.** The automatic checkpoint commit runs *with*
+  `pre-commit` hooks enabled. If a repository's hook (a secret scanner, a
+  linter) refuses the commit, that is reported as a failure — the plugin does not
+  decide that your gitleaks hook does not apply.
+* **Never commits on your behalf without being asked.** A commit happens only at
+  delivery time, only if the worktree still has uncommitted work, and only
+  because `autoCommit` is on (it is; set it false to be refused instead).
+* **Never deletes a worktree with uncommitted changes** during cleanup. Forced
+  removal happens only through the explicit **discard** action, whose menu entry
+  says what it will cost.
+
+## Install
+
+```
+dsh plugin add C:\Workspace\dsh-local-worktree
+```
+
+or, from inside DSH, `plugin_manager` with `action: "install_bundle"` and this
+directory as the target. The bundle patch inserts one host row; the browser half
+is discovered automatically from the package's `dsh.client` section.
+
+## Configuration
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Keep the surfaces but refuse every action with a reason. |
+| `autoCommit` | `true` | Commit leftover worktree work before merging (a commit subject is generated from the changed file names). |
+| `autoCleanup` | `true` | After a successful merge, remove the worktree and delete its own branch if fully merged. |
+| `commitMessage` | `wip: dsh worktree checkpoint` | Subject for the automatic commit. |
+| `registerTool` | `true` | Expose the `git_worktree` tool to the agent. |
+| `gitTimeoutMs` | `60000` | Wall-clock budget for one git command. |
+| `registryPath` | `$DSH_HOME/plugins/dsh-local-worktree/worktrees.json` | Where created worktrees are remembered. |
+
+## Three surfaces, one implementation
+
+* **The button** — `GET /api/dsh-local-worktree/{status,workspaces,health}` and
+  `POST /api/dsh-local-worktree/{create,deliver,discard,open}`. Every answer is
+  JSON with `ok` and, on refusal, a stable `reason` code and a bilingual
+  `reasonText`, so the UI never prints raw git output at you.
+* **The tool** — `git_worktree` with `action: status | create | deliver | discard`.
+  The agent can isolate its own work instead of being told to.
+* **The command** — `/worktree`, `/worktree create`, `/worktree deliver`.
+
+## Reloading after an update
+
+The client half is served through `dsh-client-modules`, and `dsh-client-hmr`
+swaps a rebuilt bundle into the running page — so a change to `client/client.js`
+reaches an open page without a refresh. A change to the **host** half (a new
+route, a new tool, a new response field) is a replaced package: DSH loads fresh
+host JavaScript only on restart. Restart the app (or the Host) after changing
+`src/`.
+
+## Styling rule (learned the hard way)
+
+Use **only** the theme tokens the running build defines. On this build that is
+fourteen: `--dsw-alias-bg-base`, `-bg-layer-1`, `-bg-layer-2`, `-bg-overlay`,
+`--dsw-alias-border-l1`, `-border-l2`, `--dsw-alias-brand-primary`,
+`--dsw-alias-label-primary`, `-label-secondary`, four `--dsw-alias-state-*`
+colours, and `--dsw-specific-sidebar-fill`. Ask the page for the live list with
+`cordis_inspect_query` (`platform: "client"`, provider `Theme`, method
+`listTokens`) instead of guessing a name.
+
+A token that does not exist is **not** a soft miss: an undefined CSS custom
+property resolves to nothing at all, so
+`background: var(--dsw-alias-bg-elevated)` produces a **transparent** popover
+whose text fights the conversation behind it. That is exactly what happened here,
+which is why `test/client.test.mjs` now fails on any `--dsw-*` reference outside
+the real list and asserts the popover keeps an opaque fallback.
+
+## Layout notes, and why
+
+The worktree goes **beside** the repository, in a sibling `<repo>_worktrees/`
+directory, never inside it: a worktree nested in the repository shows up in the
+repository's own `git status` as untracked noise.
+
+Its directory is `<repo>_<id>` and its branch is `dsh/wt/<repo>_<id>`, where
+`<id>` is a fresh `<timestamp>-<random>` pair per worktree. The underscore
+separator is deliberate: it keeps the repository name readable when that name
+itself contains hyphens, so `my-app_a4f9m3k8` names its parent unambiguously while
+`my-app-a4f9m3k8` could be a repository called that. The branch it was cut from is
+recorded — in the worktree's own git directory (`.git/worktrees/<name>/`), **not**
+in the working tree, because a file in the working tree would be committed and
+then merged into your branch. The plugin's scratch data must never be part of your
+history.
+
+git refuses a worktree whose absolute path exceeds roughly 210 characters
+(`fatal: '$GIT_DIR' too big`), and `core.longpaths` does not raise that ceiling.
+The plugin measures the path before spawning anything and refuses with a message
+that names the limit, instead of letting you read git's.
+
+## Worktree paths and the path ceiling
+
+If your repository lives deep in the filesystem, the computed sibling path may be
+too long for git. Keep repositories under a short root (for example `C:\w\`), or
+move the repository shallower — the plugin cannot shorten a path that your own
+directory layout made long, and it will tell you the measured length rather than
+fail with git's `'$GIT_DIR' too big`.
+
+## Requirements
+
+* `git` on `PATH`, version 2.38 or newer for conflict pre-detection
+  (`merge-tree --write-tree`). Older versions work; a conflict is then detected
+  by merging and rolling back with `merge --abort`, which is exercised by a test.
+* Node 22+ (the DSH runtime).
+
+## Tests
+
+```
+node --test test/
+```
+
+83 tests. The repository and operation suites run **real git** in throwaway
+repositories under the OS temp directory — no mocked child process — and the
+implementation suite drives the actual HTTP route handlers with synthetic
+requests. The assertions are about the promises above: a fast-forward stays
+linear, a diverged base gets a real merge commit with two parents, a conflicted
+delivery restores the main tree byte-for-byte, and a refused cleanup loses
+nothing.

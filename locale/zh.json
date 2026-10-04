@@ -1,0 +1,4 @@
+{
+	"title": "Git Worktree 隔离工作区",
+	"description": "一键用 git worktree 隔离开发：在仓库旁边切一个独立工作区，完成后把它的提交合并回原分支——全程本地 git，不使用 remote。"
+}

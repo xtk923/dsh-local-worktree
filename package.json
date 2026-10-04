@@ -1,0 +1,56 @@
+{
+	"name": "dsh-local-worktree",
+	"version": "0.1.0",
+	"private": true,
+	"description": "A one-click git worktree inside DSH: the button activates in a git workspace, creates an isolated worktree with local git only, and merges the worktree's commits back into the branch it came from — no remote, no GitHub. · 在 DSH 里一键用 git worktree 隔离开发，完成后一键把提交合并回原分支——全程本地，不碰 remote。",
+	"type": "module",
+	"license": "MIT",
+	"engines": {
+		"node": ">=22"
+	},
+	"main": "./src/index.js",
+	"icon": "./icon.svg",
+	"exports": {
+		".": "./src/index.js",
+		"./client": "./client/client.js",
+		"./package.json": "./package.json",
+		"./locale/*.json": "./locale/*.json"
+	},
+	"files": [
+		"src",
+		"client",
+		"locale",
+		"icon.svg",
+		"cordis.patch.yml",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"test": "node --test test/"
+	},
+	"keywords": [
+		"dsh-plugin",
+		"deepseek-harness",
+		"cordis-plugin",
+		"git",
+		"worktree",
+		"isolated-development"
+	],
+	"dsh": {
+		"bundle": {
+			"patch": "./cordis.patch.yml"
+		},
+		"client": {
+			"platform": "web",
+			"immediately": true,
+			"inject": [
+				"@deepseek-ai/dsh-client-ui-conversation",
+				"@deepseek-ai/dsh-client-ui-workspace"
+			]
+		}
+	},
+	"meta": {
+		"title": "Git Worktree",
+		"description": "One-click git worktree: isolate the work, then merge it back locally."
+	}
+}

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="Git worktree">
+  <!-- Main working tree, with the branch line that leaves it and comes back. -->
+  <g fill="none" stroke="#2f7fd1" stroke-width="2" stroke-linecap="round">
+    <path d="M16 25V12" />
+    <path d="M16 16c0-3.3 2.7-6 6-6h2" />
+    <path d="M16 20c0 3.3 2.7 6 6 6h2" />
+  </g>
+  <!-- The branch's two seats: the worktree it starts, and the merge it lands in. -->
+  <circle cx="25" cy="10" r="3" fill="#2f7fd1" />
+  <circle cx="25" cy="26" r="3" fill="#2f7fd1" />
+  <!-- The main tree's commit. -->
+  <circle cx="16" cy="8" r="4" fill="none" stroke="#2f7fd1" stroke-width="2" />
+  <circle cx="16" cy="8" r="1.6" fill="#2f7fd1" />
+</svg>

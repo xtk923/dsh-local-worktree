@@ -1,0 +1,25 @@
+# The git-worktree bundle patch.
+#
+# Adding `dsh-local-worktree` to a profile's `dsh.profile.bundles` applies this
+# automatically — there is no YAML for a user to hand-write.
+#
+# The entry name is the BARE package name deliberately: a package specifier is
+# what the loader resolves, and a subpath entry name fails that resolve. The
+# `dsh.client` half needs no row here: the browser roster is composed by scanning
+# loader entries for a `dsh.client` section, which this package's `package.json`
+# declares.
+#
+# Every value is optional; these are the recommended defaults.
+- insert:
+    - id: git-worktree
+      name: dsh-local-worktree
+      config:
+        enabled: true
+        # Commit whatever the agent left uncommitted before merging, so a merge
+        # never silently strands the last edit. Set false to refuse instead.
+        autoCommit: true
+        # After a successful merge, remove the worktree and delete its own branch
+        # (`git branch -d`, so an unmerged branch survives).
+        autoCleanup: true
+        registerTool: true
+        gitTimeoutMs: 60000

@@ -1,0 +1,895 @@
+/**
+ * workspace.js — the repository operations, driven through one injected runner.
+ *
+ * Layering, deliberately:
+ *
+ *   `git.js`      decides WHAT to do and builds argv (pure, unit-tested);
+ *   `workspace.js` runs argv, reads the repository, and orders the steps;
+ *   `index.js`    exposes the result on HTTP, as a command and as a tool.
+ *
+ * The runner is injected (`run(args, { cwd })`) rather than imported, so every
+ * test here drives real git in a throwaway repository without a mocked child
+ * process, and the plugin's own process handling stays in one place.
+ *
+ * The single most important property of this module: a failed merge leaves the
+ * user's main working tree byte-for-byte as it was. That is why `deliver`
+ * verifies the main tree is clean BEFORE spawning anything, and why the only
+ * failure recovery it performs is `git merge --abort`, which is the one command
+ * that restores the pre-merge index and worktree exactly.
+ *
+ * @module dsh-local-worktree/workspace
+ */
+
+import { readFile, stat, writeFile } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
+
+import {
+	ancestors,
+	branchName,
+	classifyGitFailure,
+	classifyRepo,
+	classifyWorktree,
+	cleanupSteps,
+	conflictedPaths,
+	describeMerge,
+	driftText,
+	freshId,
+	gitArgs,
+	META_FILE,
+	mergeSteps,
+	parseStatusV2,
+	parseWorktreePorcelain,
+	pathLengthCheck,
+	planAbort,
+	planCreate,
+	planMerge,
+	quotedFromGit,
+	repoKey,
+	samePath,
+	statusArgs,
+	suggestCommitMessage,
+	within,
+	worktreeContainer,
+	worktreePath
+} from './git.js';
+
+/** The plugin's own branch namespace; only these are ever deleted. */
+const OWN_BRANCH = /^dsh\/wt\//;
+
+/** A git invocation that failed, with the reason code the UI renders. */
+export class GitFailure extends Error {
+	constructor(reason, detail, { operation, args = [], exitCode = null, stderr = '', stdout = '' } = {}) {
+		super(detail === '' || detail === undefined ? reason : detail);
+		this.name = 'GitFailure';
+		this.reason = reason;
+		this.detail = detail ?? '';
+		this.operation = operation ?? '';
+		this.args = args;
+		this.exitCode = exitCode;
+		this.stderr = stderr;
+		this.stdout = stdout;
+	}
+
+	/** The shape a route handler answers with. */
+	toJSON() {
+		return {
+			ok: false,
+			reason: this.reason,
+			detail: this.detail,
+			operation: this.operation,
+			quoted: quotedFromGit(this.stderr !== '' ? this.stderr : this.stdout)
+		};
+	}
+}
+
+/* ------------------------------------------------------------------ reader -- */
+
+/**
+ * Reads a repository through one runner.
+ *
+ * Every read is fresh: the main tree, a worktree, or the branch list can change
+ * between two clicks (another agent, another session, the user's own terminal),
+ * so nothing is cached here — the caller decides when to reuse a snapshot.
+ */
+export class Workspace {
+	/**
+	 * @param run - `(args: string[], options?: { cwd?: string }) => Promise<{ exitCode, stdout, stderr }>`
+	 * @param options.onWarn - sink for non-fatal problems, never a logger dependency.
+	 */
+	constructor(run, { onWarn } = {}) {
+		if (typeof run !== 'function') throw new TypeError('Workspace requires a git runner');
+		this.run = run;
+		this.onWarn = typeof onWarn === 'function' ? onWarn : () => {};
+	}
+
+	/**
+	 * The repository facts for one directory, or a diagnosed absence.
+	 *
+	 * A path inside a linked worktree reports the WORKTREE it belongs to as well
+	 * as the repository, because both are needed to offer the right action: the
+	 * main tree offers "create", the worktree offers "merge back".
+	 */
+	async inspect(cwd) {
+		const start = resolve(String(cwd ?? process.cwd()));
+		const inside = await this.#findRepositoryRoot(start);
+		if (inside.root === null) {
+			return {
+				ok: true,
+				path: start,
+				repo: { present: false, usable: false, reason: inside.reason ?? 'not-a-repository' },
+				repoRoot: null,
+				localRoot: inside.localRoot ?? null,
+				repoKey: null,
+				container: null,
+				worktree: null,
+				worktrees: []
+			};
+		}
+
+		const status = await this.status(inside.root);
+		const classification = classifyRepo({ root: inside.root, status, gitCommonDir: inside.commonDir });
+		const list = await this.listWorktrees(inside.root);
+
+		// Which of the recorded worktrees, if any, contains the session's path —
+		// `git worktree list` alone cannot say, because the session may sit in a
+		// subdirectory of one. The MAIN working tree is in that same list and must
+		// be excluded here: treating it as a worktree would offer "merge back" on an
+		// ordinary checkout instead of "create", and would count its drift against
+		// itself. The branch it was cut from is read back from the metadata written
+		// at creation time; without it, drift would be counted against the wrong
+		// side and always read as zero.
+		const here = list.find((entry) => !samePath(entry.path, inside.mainTop) && within(entry.path, start)) ?? null;
+		const record = here === null
+			? null
+			: await this.worktreeState(inside.root, here, { base: (await this.#readMeta(here.path))?.base });
+
+		return {
+			ok: true,
+			path: start,
+			// `repoRoot` is the MAIN working tree — the one that owns the branch a
+			// delivery merges into. `localRoot` is where the session actually is,
+			// which differs whenever the agent is working inside a worktree.
+			repoRoot: inside.root,
+			localRoot: inside.localRoot ?? inside.root,
+			gitDir: inside.gitDir,
+			gitCommonDir: inside.commonDir,
+			repoKey: repoKey(inside.commonDir),
+			container: worktreeContainer(inside.root),
+			repo: {
+				...classification,
+				branch: status.branch,
+				head: status.head,
+				detached: status.detached,
+				unborn: status.unborn,
+				dirty: status.dirty,
+				modified: status.staged + status.unstaged,
+				untracked: status.untracked,
+				conflicted: status.conflicted,
+				ahead: status.ahead,
+				behind: status.behind
+			},
+			worktree: record,
+			worktrees: list
+		};
+	}
+
+	/**
+	 * `git status` for one repository or worktree, parsed, with `dirty` decided
+	 * by CONTENT rather than by `status`'s entry list.
+	 *
+	 * Why that matters: `git status` can report an entry for a file whose
+	 * stat information is stale relative to the index (a fresh checkout, a
+	 * `core.autocrlf` filter, a filesystem with coarse timestamps). Treating such
+	 * an entry as "the agent changed something" would make this plugin auto-commit
+	 * and then merge a commit that contains NOTHING — history noise the user never
+	 * asked for. `git diff --quiet` and `git diff --cached --quiet` compare real
+	 * content and exit 1 only when there is a real difference.
+	 *
+	 * Uses the NON-throwing runner: a repository can disappear or be unreadable
+	 * between two polls, and a status read is the one place that must degrade to
+	 * "no repository here" instead of an error the UI has to special-case.
+	 */
+	async status(cwd) {
+		const result = await this.#run(cwd, statusArgs({ cwd }));
+		const status = result.exitCode !== 0 ? parseStatusV2('') : parseStatusV2(result.stdout);
+		const real = await this.#realChanges(cwd);
+		return {
+			...status,
+			dirty: real.dirty,
+			// The file list keeps the status view (it has the nice porcelain paths)
+			// but the counts follow the content check, so the two never disagree.
+			staged: real.staged,
+			unstaged: real.unstaged,
+			untracked: real.untracked,
+			entries: real.entries.length > 0 ? real.entries : status.entries
+		};
+	}
+
+	/**
+	 * Content-level change detection.
+	 *
+	 * `git diff --quiet` (1 = unstaged difference), `git diff --cached --quiet`
+	 * (1 = staged difference) and `git ls-files --others --exclude-standard`
+	 * (untracked files) together answer "would a commit or a merge lose, hide or
+	 * create anything", without trusting stat data.
+	 */
+	async #realChanges(cwd) {
+		const empty = { dirty: false, staged: 0, unstaged: 0, untracked: 0, entries: [] };
+		if (!(await pathExists(cwd))) return empty;
+
+		const [unstaged, staged, untracked] = await Promise.all([
+			this.#run(cwd, gitArgs(['diff', '--quiet'], { cwd })),
+			this.#run(cwd, gitArgs(['diff', '--cached', '--quiet'], { cwd })),
+			this.#run(cwd, gitArgs(['ls-files', '--others', '--exclude-standard', '-z'], { cwd }))
+		]);
+		if (unstaged.exitCode !== 0 && unstaged.exitCode !== 1) return empty;
+
+		const names = await this.#run(cwd, gitArgs(['diff', '--name-only'], { cwd }));
+		const stagedNames = await this.#run(cwd, gitArgs(['diff', '--cached', '--name-only'], { cwd }));
+		const untrackedNames = untracked.exitCode === 0
+			? String(untracked.stdout ?? '').split('\0').filter((name) => name !== '')
+			: [];
+
+		const entries = [
+			...splitLines(names.stdout).map((name) => `1 M. ${name}`),
+			...splitLines(stagedNames.stdout).map((name) => `1 .M ${name}`),
+			...untrackedNames.map((name) => `? ${name}`)
+		];
+
+		return {
+			dirty: unstaged.exitCode === 1 || staged.exitCode === 1 || untrackedNames.length > 0,
+			staged: splitLines(stagedNames.stdout).length,
+			unstaged: splitLines(names.stdout).length,
+			untracked: untrackedNames.length,
+			entries
+		};
+	}
+
+	/** Every linked worktree git knows about, main tree included. */
+	async listWorktrees(cwd) {
+		const result = await this.#run(cwd, gitArgs(['worktree', 'list', '--porcelain', '-z'], { cwd }));
+		if (result.exitCode !== 0) return [];
+		return parseWorktreePorcelain(result.stdout);
+	}
+
+	/**
+	 * How far one worktree has drifted, and whether it can be delivered.
+	 *
+	 * `ahead`/`baseAhead` come from `rev-list --count` on the two sides; the base
+	 * branch is supplied by the caller (it is recorded at creation time, because
+	 * a later `HEAD` may not be the branch the worktree was cut from).
+	 */
+	async worktreeState(repoRoot, entry, { base } = {}) {
+		const path = typeof entry === 'string' ? entry : entry?.path;
+		const exists = await pathExists(path);
+		if (!exists) {
+			return classifyWorktree({ present: false, path, head: entry?.head ?? null, branch: entry?.branch ?? null, base: base ?? null });
+		}
+		const status = await this.status(path);
+		const head = await this.head(path);
+		const baseBranch = typeof base === 'string' && base !== '' ? base : null;
+
+		let ahead = 0;
+		let baseAhead = 0;
+		let baseHead = null;
+		if (baseBranch !== null) {
+			baseHead = await this.head(repoRoot, baseBranch);
+			if (baseHead !== null && head !== null) {
+				ahead = await this.count(repoRoot, `${baseHead}..${head}`);
+				baseAhead = await this.count(repoRoot, `${head}..${baseHead}`);
+			}
+		}
+
+		return classifyWorktree({
+			present: true,
+			path,
+			head,
+			branch: entry?.branch ?? status.branch,
+			status,
+			base: baseBranch,
+			baseHead,
+			mainHead: await this.head(repoRoot),
+			ahead,
+			baseAhead
+		});
+	}
+
+	/** The commit a ref points at, or null when it does not exist (yet). */
+	async head(cwd, ref = 'HEAD') {
+		const result = await this.#run(cwd, gitArgs(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd }));
+		if (result.exitCode !== 0) return null;
+		const value = String(result.stdout ?? '').trim();
+		return value === '' ? null : value;
+	}
+
+	/** `rev-list --count <range>`, 0 when the range is unusable. */
+	async count(cwd, range) {
+		const result = await this.#run(cwd, gitArgs(['rev-list', '--count', range], { cwd }));
+		if (result.exitCode !== 0) return 0;
+		const value = Number.parseInt(String(result.stdout ?? '').trim(), 10);
+		return Number.isFinite(value) ? value : 0;
+	}
+
+	/** Whether `ancestor` is already contained in `descendant` — fast-forwardability. */
+	async isAncestor(cwd, ancestor, descendant) {
+		if (typeof ancestor !== 'string' || typeof descendant !== 'string') return false;
+		const result = await this.#run(cwd, gitArgs(['merge-base', '--is-ancestor', ancestor, descendant], { cwd }));
+		return result.exitCode === 0;
+	}
+
+	/**
+	 * Whether merging `branch` into the current HEAD would conflict.
+	 *
+	 * `git merge-tree --write-tree` computes the merge WITHOUT touching the
+	 * working tree, the index, HEAD or MERGE_* state (verified on git 2.52), so
+	 * the plugin can report a conflict while the user's main tree is still
+	 * untouched — which is strictly better than merging and rolling back.
+	 *
+	 * Exit 1 means conflict; exit 0 means clean. Any OTHER exit code means this
+	 * git cannot answer the question (`merge-tree --write-tree` needs 2.38+), so
+	 * the answer is "unknown" and the caller falls back to merging and aborting.
+	 */
+	async conflictsWith(cwd, branch) {
+		const result = await this.#run(cwd, gitArgs(['merge-tree', '--write-tree', 'HEAD', branch], { cwd }));
+		if (result.exitCode === 0) return { known: true, conflict: false };
+		if (result.exitCode === 1) {
+			return { known: true, conflict: true, paths: conflictedPaths(`${result.stdout}\n${result.stderr}`) };
+		}
+		return { known: false, conflict: false };
+	}
+
+	/** Whether a commit has an author identity to use (user.email, then user.name). */
+	async hasIdentity(cwd) {
+		const email = await this.#run(cwd, gitArgs(['config', '--get', 'user.email'], { cwd }));
+		if (email.exitCode === 0 && String(email.stdout ?? '').trim() !== '') return true;
+		const name = await this.#run(cwd, gitArgs(['config', '--get', 'user.name'], { cwd }));
+		return name.exitCode === 0 && String(name.stdout ?? '').trim() !== '';
+	}
+
+	/* ----------------------------------------------------------- operations -- */
+
+	/**
+	 * Create the worktree, and report where it is.
+	 *
+	 * Every call mints a FRESH identity, so pressing the button twice produces two
+	 * worktrees rather than reusing one — a second click that silently returns the
+	 * first worktree reads as "nothing happened", which is exactly the confusion
+	 * this replaced. The identity is collision-checked against both the filesystem
+	 * and git's own worktree list, with a small bounded retry, so a same-millisecond
+	 * double click inside one process still yields two distinct worktrees.
+	 *
+	 * The start point is resolved to an OID first and passed explicitly: between
+	 * the click and the spawn the main tree can move, and a worktree that starts
+	 * somewhere else than the UI promised is a bug nobody can see afterwards.
+	 */
+	async create(repoRoot, { branch, path: targetPath, startPoint, id } = {}) {
+		const root = resolve(String(repoRoot));
+
+		// A caller that supplies BOTH a path and a branch is fully explicit (a test,
+		// or a script re-creating a known worktree); otherwise an identity is minted.
+		const explicit = typeof targetPath === 'string' && targetPath !== '' && typeof branch === 'string' && branch !== '';
+
+		const status = await this.status(root);
+		const classification = classifyRepo({ root, status, gitCommonDir: await this.#commonDir(root) });
+		if (!classification.usable) throw new GitFailure(classification.reason, '', { operation: 'create' });
+		if (status.detached) throw new GitFailure('detached-head', '', { operation: 'create' });
+
+		const startOid = (await this.head(root, startPoint ?? 'HEAD')) ?? status.head;
+		if (startOid === null) throw new GitFailure('no-commits-yet', '', { operation: 'create' });
+
+		const known = new Map((await this.listWorktrees(root)).map((entry) => [entry.path.toLowerCase(), entry]));
+		let plan = null;
+		let lastRefusal = null;
+		for (let attempt = 0; attempt < 8 && plan === null; attempt += 1) {
+			const candidateId = explicit ? 'explicit' : (typeof id === 'string' && id !== '' ? id : freshId());
+			const candidatePath = explicit ? resolve(targetPath) : worktreePath(root, candidateId);
+			const candidateBranch = explicit ? branch : branchName(root, candidateId);
+
+			// A path git cannot build is not worth a probe, and the refusal must name
+			// the real limit rather than let git say `'$GIT_DIR' too big`.
+			const length = pathLengthCheck(candidatePath);
+			if (length.ok !== true) {
+				throw new GitFailure(length.reason, `${length.length} characters (git refuses past ${length.ceiling})`, {
+					operation: 'create'
+				});
+			}
+
+			const taken = known.get(candidatePath.toLowerCase()) !== undefined || (await pathExists(candidatePath));
+			const branchTaken = (await this.branchExists(root, candidateBranch)) === true;
+			if (taken || branchTaken) {
+				lastRefusal = new GitFailure('worktree-exists', candidatePath, { operation: 'create' });
+				if (explicit) throw lastRefusal;
+				continue;
+			}
+			plan = planCreate({ localRoot: root, id: candidateId, branch: candidateBranch, startPoint: startOid, path: candidatePath });
+		}
+		if (plan === null) throw lastRefusal ?? new GitFailure('worktree-exists', '', { operation: 'create' });
+
+		await this.#must(root, gitArgs(plan.args, { cwd: root }), 'worktree-add');
+		await this.#writeMeta(plan.path, {
+			version: 1,
+			branch: plan.branch,
+			base: status.branch,
+			startOid,
+			localRoot: root,
+			createdAt: new Date().toISOString(),
+			plugin: 'dsh-local-worktree'
+		});
+
+		return {
+			ok: true,
+			reused: false,
+			path: plan.path,
+			branch: plan.branch,
+			base: status.branch,
+			baseHead: status.head,
+			startOid,
+			container: plan.container
+		};
+	}
+
+	/** Whether a local branch already exists. */
+	async branchExists(repoRoot, branch) {
+		if (typeof branch !== 'string' || branch === '') return false;
+		const result = await this.#run(repoRoot, gitArgs(['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: repoRoot }));
+		return result.exitCode === 0;
+	}
+
+	/**
+	 * Merge the worktree's commits into the main tree's branch, then clean up.
+	 *
+	 * The sequence, and why each part exists:
+	 *
+	 *   1. everything is DECIDED before anything is written (`planMerge`);
+	 *   2. uncommitted worktree work is committed first, so a merge never loses
+	 *      an agent's last edit;
+	 *   3. the base revision is captured immediately before the merge, so the
+	 *      plan can be invalidated if the main tree moved while we read it;
+	 *   4. on any failure the main tree is rolled back with `merge --abort` and
+	 *      the worktree is KEPT — a conflict must cost a retry, not the work.
+	 */
+	async deliver(repoRoot, entry, { base, message, cleanup = true, autoCommit = true } = {}) {
+		const root = resolve(String(repoRoot));
+		const path = typeof entry === 'string' ? entry : entry?.path;
+		if (typeof path !== 'string' || path === '') throw new GitFailure('worktree-missing', '', { operation: 'deliver' });
+		if (!(await pathExists(path))) throw new GitFailure('worktree-missing', path, { operation: 'deliver' });
+
+		const meta = await this.#readMeta(path);
+		const baseBranch = typeof base === 'string' && base !== '' ? base : meta?.base ?? null;
+
+		const mainStatus = await this.status(root);
+		const worktreeStatus = await this.status(path);
+		const worktreeHead = await this.head(path);
+		const mainHead = await this.head(root);
+		const baseHead = baseBranch === null ? null : await this.head(root, baseBranch);
+
+		const ahead = baseHead !== null && worktreeHead !== null
+			? await this.count(root, `${baseHead}..${worktreeHead}`)
+			: 0;
+		const baseAhead = baseHead !== null && worktreeHead !== null
+			? await this.count(root, `${worktreeHead}..${baseHead}`)
+			: 0;
+
+		const commitMessage = typeof message === 'string' && message.trim() !== ''
+			? message.trim()
+			: suggestCommitMessage(worktreeStatus, { prefix: 'wip: dsh worktree checkpoint' });
+
+		const worktreeBranch = typeof entry === 'object' && entry !== null
+			? entry.branch
+			: ((await this.#currentBranch(path)) ?? meta?.branch ?? null);
+
+		const plan = planMerge({
+			sameRepo: await this.#sameRepository(root, path),
+			mainBranch: mainStatus.branch,
+			base: baseBranch,
+			mainHead,
+			mainStatus,
+			worktreeBranch,
+			worktreeHead,
+			worktreeDirty: worktreeStatus.dirty,
+			commitMessage,
+			autoCommit,
+			hasIdentity: worktreeStatus.dirty ? await this.hasIdentity(root) : true
+		});
+
+		if (plan.ok !== true) {
+			return {
+				ok: false,
+				reason: plan.reason,
+				detail: plan.detail ?? '',
+				kept: true,
+				worktree: { path, branch: plan.worktreeBranch ?? worktreeBranch, ahead, baseAhead, dirty: worktreeStatus.dirty }
+			};
+		}
+
+		// Dry-run the merge when the two sides have diverged. `--ff` cannot
+		// conflict, so a fast-forward skips this; a diverged merge gets an answer
+		// from `merge-tree --write-tree`, which touches nothing — so a conflict is
+		// reported while the main tree is still untouched rather than rolled back.
+		let conflictCheck = { known: true, conflict: false };
+		if (baseAhead > 0 && typeof worktreeBranch === 'string' && worktreeBranch !== '') {
+			conflictCheck = await this.conflictsWith(root, worktreeBranch);
+		}
+		if (conflictCheck.conflict === true) {
+			return {
+				ok: false,
+				reason: 'merge-conflict',
+				detail: '',
+				detectedBy: 'merge-tree',
+				conflictPaths: conflictCheck.paths ?? [],
+				aborted: false,
+				kept: true,
+				worktree: { path, branch: worktreeBranch, ahead, baseAhead, dirty: worktreeStatus.dirty }
+			};
+		}
+
+		const steps = mergeSteps(plan);
+		const executed = [];
+		for (const step of steps) {
+			// WHERE each step runs is part of the step's meaning, and the two
+			// differ: the checkpoint commit belongs in the worktree (that is where
+			// the agent's work is), while the merge belongs in the MAIN tree (that
+			// is the branch the commits are being delivered to). Running the merge
+			// in the worktree merges the branch into itself, reports "Already up to
+			// date" and silently delivers nothing.
+			const inWorktree = step.id === 'stage' || step.id === 'commit';
+			const cwd = inWorktree ? path : root;
+			const result = await this.#run(cwd, gitArgs(step.args, { cwd }));
+			executed.push({ id: step.id, exitCode: result.exitCode, cwd: inWorktree ? 'worktree' : 'main' });
+			if (result.exitCode !== 0) {
+				if (step.id === 'commit' && /nothing to commit|no changes added/i.test(`${result.stdout}${result.stderr}`)) {
+					// A tree that is dirty only through ignored files has nothing to
+					// commit; that is not a failure, and the merge can continue.
+					continue;
+				}
+				if (step.abortOnFailure === true) await this.#abort(root);
+				const reason = classifyGitFailure(result);
+				return {
+					ok: false,
+					reason,
+					detail: '',
+					quoted: quotedFromGit(`${result.stderr}\n${result.stdout}`),
+					aborted: step.abortOnFailure === true,
+					kept: true,
+					worktree: { path, branch: plan.worktreeBranch, ahead: 0, baseAhead, dirty: worktreeStatus.dirty }
+				};
+			}
+		}
+
+		// The merge reported success; confirm it actually landed before claiming it.
+		const finalMainHead = await this.head(root);
+		const landed = worktreeHead === null ? false : await this.isAncestor(root, worktreeHead, finalMainHead ?? 'HEAD');
+		if (!landed) {
+			await this.#abort(root);
+			return { ok: false, reason: 'git-error', detail: 'the merge did not land', aborted: true, kept: true };
+		}
+
+		const shape = describeMerge({ baseAhead: worktreeHead === null ? 0 : await this.count(root, `${worktreeHead}..${finalMainHead ?? 'HEAD'}`) });
+		const summary = {
+			ok: true,
+			strategy: shape.strategy,
+			strategyText: shape.text,
+			base: baseBranch,
+			branch: plan.worktreeBranch,
+			commits: ahead,
+			mainHead: finalMainHead,
+			worktreeHead,
+			preCommitted: plan.preCommit !== null,
+			executed
+		};
+
+		if (cleanup === true) summary.cleanup = await this.cleanup(root, { path, branch: plan.worktreeBranch });
+		return summary;
+	}
+
+	/**
+	 * Remove a finished worktree and its own branch.
+	 *
+	 * `-d` (never `-D`) for the branch: if the commits are not merged, git
+	 * refuses and the branch survives. Silently forcing that delete is how a
+	 * plugin loses somebody's only copy of a day's work.
+	 */
+	async cleanup(repoRoot, { path, branch, force = false } = {}) {
+		const root = resolve(String(repoRoot));
+		const steps = cleanupSteps({ path, branch, force, deleteBranch: typeof branch === 'string' && OWN_BRANCH.test(branch) });
+		const results = [];
+		for (const step of steps) {
+			const result = await this.#run(root, gitArgs(step.args, { cwd: root }));
+			if (result.exitCode !== 0) {
+				const reason = classifyGitFailure(result);
+				// `git worktree remove` refuses on a dirty tree. Falling back to a
+				// forced removal is NOT automatic: the caller asked for it or not.
+				results.push({ id: step.id, ok: false, reason });
+				if (step.id === 'remove') return { ok: false, removed: false, reason, steps: results };
+				continue;
+			}
+			results.push({ id: step.id, ok: true });
+		}
+		return { ok: true, removed: true, branchDeleted: results.some((entry) => entry.id === 'branch' && entry.ok), steps: results };
+	}
+
+	/** Discard a worktree without merging: the explicit "throw this away". */
+	async discard(repoRoot, { path, branch } = {}) {
+		const root = resolve(String(repoRoot));
+		if (!(await pathExists(path))) {
+			await this.#run(root, gitArgs(['worktree', 'prune'], { cwd: root }));
+			return { ok: true, removed: true, branchDeleted: typeof branch === 'string' ? await this.deleteBranch(root, branch) : false };
+		}
+		const result = await this.cleanup(root, { path, branch, force: true });
+		return { ok: result.ok, removed: result.removed, reason: result.reason ?? null, branchDeleted: result.branchDeleted === true };
+	}
+
+	/** Delete a branch, but only one of ours and only if fully merged. */
+	async deleteBranch(repoRoot, branch) {
+		if (typeof branch !== 'string' || !OWN_BRANCH.test(branch)) return false;
+		const result = await this.#run(repoRoot, gitArgs(['branch', '-d', branch], { cwd: repoRoot }));
+		return result.exitCode === 0;
+	}
+
+	/** A short human summary for a status payload. */
+	async drift(repoRoot, entry, { base } = {}) {
+		const state = await this.worktreeState(repoRoot, entry, { base });
+		return { ...state, text: driftText(state) };
+	}
+
+	/* -------------------------------------------------------------- private -- */
+
+	/**
+	 * The repository containing `start`, found by walking up.
+	 *
+	 * A linked worktree and a normal repository both have `.git`, but as a FILE (a
+	 * `gitdir:` pointer) in the worktree's case. That is the trap this method
+	 * exists to avoid: `git rev-parse --show-toplevel` inside a linked worktree
+	 * answers with THE WORKTREE, not the main working tree — so a session running
+	 * in a worktree would be told its repository root is the worktree, and every
+	 * drift count computed against "HEAD" would be counted against itself (always
+	 * zero). The main working tree is derived from the COMMON git dir instead.
+	 */
+	async #findRepositoryRoot(start) {
+		for (const candidate of ancestors(start)) {
+			const marker = await gitMarker(candidate);
+			if (marker === null) continue;
+			const paths = await this.#revParsePaths(candidate);
+			if (paths === null) {
+				return { root: candidate, localRoot: candidate, mainTop: candidate, gitDir: resolve(candidate, '.git'), commonDir: resolve(candidate, '.git'), reason: null };
+			}
+			const main = await this.#mainWorktreeRoot(candidate, paths.commonDir);
+			return { ...paths, root: main.root, localRoot: main.localRoot, mainTop: main.mainTop, reason: main.reason };
+		}
+		return { root: null, localRoot: null, mainTop: null, gitDir: null, commonDir: null, reason: 'not-a-repository' };
+	}
+
+	/**
+	 * The working tree that owns the repository, the working tree we are in, and
+	 * the main working tree's own top level.
+	 *
+	 * All three are needed and they are not the same directory: the session may be
+	 * inside a linked worktree (`localRoot`), the branch a delivery merges into
+	 * belongs to the main working tree (`root`), and `mainTop` is how that main
+	 * tree identifies its own `git worktree list` entry — the entry that must NOT
+	 * be mistaken for a worktree of ours.
+	 *
+	 * A submodule is deliberately refused. Its git dir is NOT
+	 * `<common>/worktrees/<name>`, so the "parent of the common dir" rule below
+	 * would name the superproject and the plugin would offer to merge a
+	 * submodule's branch into the wrong repository.
+	 */
+	async #mainWorktreeRoot(at, commonDir) {
+		const top = (await this.#run(at, gitArgs(['rev-parse', '--show-toplevel'], { cwd: at }))).stdout.trim();
+		const localRoot = top === '' ? resolve(at) : resolve(top);
+
+		// A submodule has a git dir that is not `<common>/worktrees/<name>`, so
+		// reading `core.worktree` is the reliable signal. It is set only there.
+		const coreWorktree = await this.#run(localRoot, gitArgs(['config', '--get', 'core.worktree'], { cwd: localRoot }));
+		if (coreWorktree.exitCode === 0 && coreWorktree.stdout.trim() !== '') {
+			return { root: null, localRoot, mainTop: localRoot, reason: 'submodule-unsupported' };
+		}
+
+		// `<main>/.git` for a normal repository, `<main>/.git/worktrees/<name>` for a
+		// linked worktree. Walking up past any `worktrees` component finds `<main>`.
+		let current = resolve(commonDir);
+		for (;;) {
+			const parent = dirname(current);
+			if (parent === current) break;
+			if (basename(current) === 'worktrees' || basename(parent) === '.git') {
+				return { root: parent, localRoot, mainTop: resolve(parent), reason: null };
+			}
+			current = parent;
+		}
+		const root = dirname(resolve(commonDir));
+		return { root, localRoot, mainTop: root, reason: null };
+	}
+
+	async #revParsePaths(cwd) {
+		const result = await this.#run(cwd, gitArgs(['rev-parse', '--show-toplevel', '--git-dir', '--git-common-dir'], { cwd }));
+		if (result.exitCode !== 0) return null;
+		const [top, gitDir, commonDir] = String(result.stdout ?? '').split(/\r?\n/);
+		if (top === undefined || top === '' || gitDir === undefined || commonDir === undefined) return null;
+		return {
+			root: resolve(top.trim()),
+			gitDir: resolve(cwd, gitDir.trim()),
+			commonDir: resolve(cwd, commonDir.trim()),
+			reason: null
+		};
+	}
+
+	async #commonDir(cwd) {
+		const paths = await this.#revParsePaths(cwd);
+		return paths?.commonDir ?? null;
+	}
+
+	async #currentBranch(cwd) {
+		const result = await this.#run(cwd, gitArgs(['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd }));
+		if (result.exitCode !== 0) return null;
+		const value = String(result.stdout ?? '').trim();
+		return value === '' ? null : value;
+	}
+
+	/**
+	 * Whether two paths are the same repository.
+	 *
+	 * Compared through the COMMON git dir, so a main tree and its own worktree
+	 * pass (that is the intended pairing) while a worktree of a different clone
+	 * fails even if the branch names happen to match.
+	 */
+	async #sameRepository(a, b) {
+		const left = await this.#commonDir(a);
+		const right = await this.#commonDir(b);
+		if (left === null || right === null) return false;
+		return samePath(left, right);
+	}
+
+	/** Roll the main tree back to its pre-merge state, warning if that fails. */
+	async #abort(repoRoot) {
+		const { args } = planAbort();
+		const result = await this.#run(repoRoot, gitArgs(args, { cwd: repoRoot }));
+		if (result.exitCode !== 0) {
+			// The rollback failing is the one case a user MUST hear about, so it is
+			// reported rather than swallowed: `merge --abort` failing can mean a
+			// conflict was resolved by hand mid-merge.
+			this.onWarn(`dsh-local-worktree: merge --abort failed in ${repoRoot}: ${String(result.stderr ?? '').trim()}`);
+		}
+		return result.exitCode === 0;
+	}
+
+	/**
+	 * Where this worktree's own bookkeeping belongs.
+	 *
+	 * NOT in the working tree: a file inside the worktree shows up in `git
+	 * status`, gets swept into the agent's next `git add -A`, and is then MERGED
+	 * INTO THE USER'S BRANCH — which is how a plugin's scratch file ends up in
+	 * somebody's history. A linked worktree has its own git directory
+	 * (`<common>/worktrees/<name>`, named after the path's basename, NOT the
+	 * branch), and that directory is invisible to every git command.
+	 */
+	async #metaDir(worktreePath) {
+		const marker = resolve(worktreePath, '.git');
+		try {
+			const info = await stat(marker);
+			if (info.isDirectory()) return marker;
+			const text = await readFile(marker, 'utf8');
+			const match = /^gitdir:\s*(.+?)\s*$/m.exec(text);
+			if (match === null) return marker;
+			return resolve(dirname(marker), match[1]);
+		} catch {
+			// No marker: fall back to the worktree itself, and expect the write to
+			// fail loudly in the warning rather than silently landing in the tree.
+			return marker;
+		}
+	}
+
+	async #writeMeta(path, value) {
+		try {
+			const dir = await this.#metaDir(path);
+			await writeFile(join(dir, META_FILE), `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+			return true;
+		} catch (error) {
+			// Losing the metadata costs convenience, not correctness: the registry
+			// and `git worktree list` both still know about the worktree.
+			this.onWarn(`dsh-local-worktree: could not write worktree metadata for ${path}: ${error?.message ?? error}`);
+			return false;
+		}
+	}
+
+	async #readMeta(path) {
+		for (const candidate of [join(await this.#metaDir(path), META_FILE), resolve(path, META_FILE)]) {
+			try {
+				const parsed = JSON.parse(await readFile(candidate, 'utf8'));
+				if (parsed !== null && typeof parsed === 'object') return parsed;
+			} catch {
+				// Try the next location; an absent metadata file is normal.
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Run git IN a directory, tolerating a non-zero exit.
+	 *
+	 * The directory is the first argument on purpose. Every earlier revision of
+	 * this file that passed `cwd` in an options object eventually ran a command in
+	 * the wrong repository — a `git merge` that merges the worktree's own branch
+	 * reports "Already up to date" and looks like a success. Naming the directory
+	 * where each command belongs makes that class of mistake visible at the call
+	 * site.
+	 */
+	async #run(cwd, args) {
+		let result;
+		try {
+			result = await this.run(args, { cwd });
+		} catch (error) {
+			if (error?.code === 'ENOENT') throw new GitFailure('git-missing', String(error?.message ?? error), { args });
+			throw error;
+		}
+		if (result === null || typeof result !== 'object') {
+			return { exitCode: 1, stdout: '', stderr: 'the git runner returned nothing' };
+		}
+		return {
+			exitCode: Number(result.exitCode) || 0,
+			stdout: String(result.stdout ?? ''),
+			stderr: String(result.stderr ?? '')
+		};
+	}
+
+	/**
+	 * Run git in a directory and require success, converting every failure into a
+	 * GitFailure. Only OPERATIONS use this; reads go through {@link #run} and treat
+	 * a non-zero exit as data, because a status poll must not throw when a
+	 * repository is deleted out from under a live session.
+	 */
+	async #must(cwd, args, operation) {
+		let result;
+		try {
+			result = await this.run(args, { cwd });
+		} catch (error) {
+			const reason = error?.code === 'ENOENT' ? 'git-missing' : (error?.killed === true ? 'git-timeout' : 'git-failed');
+			throw new GitFailure(reason, String(error?.message ?? error), { operation, args });
+		}
+		if (result === null || typeof result !== 'object') {
+			throw new GitFailure('git-failed', 'the git runner returned nothing', { operation, args });
+		}
+		if (result.exitCode !== 0) {
+			const stdout = String(result.stdout ?? '');
+			const stderr = String(result.stderr ?? '');
+			throw new GitFailure(classifyGitFailure({ stdout, stderr, exitCode: result.exitCode }), '', {
+				operation,
+				args,
+				exitCode: result.exitCode,
+				stdout,
+				stderr
+			});
+		}
+		return result;
+	}
+}
+
+/** Whether a path exists (any type). */
+async function pathExists(path) {
+	if (typeof path !== 'string' || path === '') return false;
+	try {
+		await stat(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Non-empty lines of git output, CRLF-tolerant. */
+function splitLines(text) {
+	return String(text ?? '')
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter((line) => line !== '');
+}
+
+/** `.git` as a directory or a file, or null when this directory has neither. */
+async function gitMarker(directory) {
+	try {
+		const info = await stat(resolve(directory, '.git'));
+		return info.isDirectory() ? 'dir' : 'file';
+	} catch {
+		return null;
+	}
+}
+
+export { pathExists, worktreePath };

@@ -1,0 +1,80 @@
+# ---------------------------------------------------------------------------
+# dsh-local-worktree — what must never enter this repository
+#
+# The plugin has no build step and no runtime dependencies (package.json has no
+# `dependencies`/`devDependencies`; `npm test` is `node --test test/`), so this
+# list is deliberately short: it covers installed trees, editor/OS noise, and
+# the credential-shaped files a secret scanner exists to catch.
+# ---------------------------------------------------------------------------
+
+# --- dependencies -----------------------------------------------------------
+# Nothing is installed today, but a contributor who runs `npm install` (or a
+# tool that does it for them) must not be able to commit the result.
+node_modules/
+.pnpm-store/
+.yarn/
+jspm_packages/
+
+# --- build output -----------------------------------------------------------
+# The plugin ships `src/`, `client/` and `locale/` as-is (see package.json
+# "files"), so anything generated is a local artifact, never a source of truth.
+dist/
+lib/
+build/
+out/
+*.tsbuildinfo
+
+# --- test / coverage --------------------------------------------------------
+coverage/
+.nyc_output/
+*.lcov
+# The suite already runs in os.tmpdir() (test/fixture.mjs), so these only catch
+# a future test that forgets to.
+.tmp/
+tmp/
+*.tmp
+
+# --- logs -------------------------------------------------------------------
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# --- credentials and secrets ------------------------------------------------
+# Belt to the gitleaks pre-commit hook's braces (.git/hooks/pre-commit): a file
+# that never reaches the index cannot be leaked by a commit, a `git add -A`, or
+# the plugin's own auto-commit path.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+secrets.json
+credentials.json
+# DSH's own credential store, if a workspace ever sits next to one.
+.dsh/credentials*
+auth.json
+
+# --- this plugin's runtime artifacts ----------------------------------------
+# `.dsh-worktree.json` records the base branch of a worktree. The plugin writes
+# it into the WORKTREE'S GIT DIR precisely so it cannot be committed, and falls
+# back to the worktree root only if that fails — this line covers the fallback.
+.dsh-worktree.json
+
+# --- editors and operating systems ------------------------------------------
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

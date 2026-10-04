@@ -1,0 +1,4 @@
+{
+	"title": "Git Worktree",
+	"description": "One-click git worktree: isolate the work in a linked worktree, then merge its commits back into the branch it came from — local git only, no remote."
+}
