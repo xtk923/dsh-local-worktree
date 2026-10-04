@@ -32,12 +32,13 @@ import { dirname, join, resolve } from 'node:path';
 import { stat } from 'node:fs/promises';
 
 import { createGitRunner } from './git-runner.js';
-import { describeMerge, freshId, samePath, suggestCommitMessage, worktreeContainer } from './git.js';
+import { describeMerge, freshId, normalizeWorktreeLayout, samePath, suggestCommitMessage } from './git.js';
 import {
 	defaultRegistryPath,
 	findByPath,
 	listWorktrees,
 	loadRegistry,
+	patchWorktree,
 	putWorktree,
 	dropWorktree,
 	saveRegistry
@@ -64,6 +65,7 @@ export const ROUTES = Object.freeze({
 	deliver: `${API_PREFIX}/deliver`,
 	discard: `${API_PREFIX}/discard`,
 	open: `${API_PREFIX}/open`,
+	session: `${API_PREFIX}/session`,
 	workspaces: `${API_PREFIX}/workspaces`,
 	health: `${API_PREFIX}/health`
 });
@@ -83,6 +85,12 @@ export const configSchema = {
 		},
 		commitMessage: { type: 'string', description: 'Subject used for the automatic checkpoint commit.' },
 		registerTool: { type: 'boolean', description: 'Expose the git_worktree tool to the agent.' },
+		worktreeLayout: {
+			type: 'string',
+			enum: ['sibling', 'inside'],
+			description:
+				'Where a worktree lands: `inside` (default) is `<repo>/.dsh-worktrees/<name>`, so the Web sidebar can nest it under the repository\'s own group; `sibling` is the older `<parent>/<repo>_worktrees/<name>`.'
+		},
 		gitTimeoutMs: { type: 'number', description: 'Wall-clock budget for one git command.' },
 		registryPath: { type: 'string', description: 'Override the remembered-worktree file location.' }
 	},
@@ -102,6 +110,10 @@ export function normalizeConfig(raw) {
 			? input.commitMessage.trim()
 			: 'wip: dsh worktree checkpoint',
 		registerTool: bool(input.registerTool, true),
+		// `inside` by default: it is the only layout whose worktree can appear
+		// inside the repository's own sidebar group, and a worktree that is hard
+		// to find is the problem this plugin exists to remove.
+		worktreeLayout: input.worktreeLayout === undefined ? 'inside' : normalizeWorktreeLayout(input.worktreeLayout),
 		gitTimeoutMs: positive(input.gitTimeoutMs, 60_000),
 		registryPath: typeof input.registryPath === 'string' && input.registryPath !== '' ? input.registryPath : null
 	};
@@ -243,8 +255,10 @@ export async function buildStatus(api, cwd) {
 		// The fixed part of where a new worktree will land. The full path now carries
 		// a fresh id per worktree, so the UI shows the CONTAINER plus the fact that a
 		// new directory is minted each time, rather than a path that would be wrong
-		// the moment a second worktree exists.
-		worktreeContainer: state.repoRoot === null ? null : worktreeContainer(state.repoRoot),
+		// the moment a second worktree exists. Taken from the inspection itself
+		// rather than recomputed, so the layout cannot be applied in one place and
+		// forgotten in the other.
+		worktreeContainer: state.repoRoot === null ? null : state.container,
 		base,
 		merge,
 		action
@@ -275,7 +289,7 @@ export function createApi(ctx, rawConfig) {
 	};
 
 	const runner = createGitRunner({ timeoutMs: config.gitTimeoutMs });
-	const workspace = new Workspace(runner, { onWarn: warn });
+	const workspace = new Workspace(runner, { onWarn: warn, layout: config.worktreeLayout });
 	const registryPath = config.registryPath ?? defaultRegistryPath(process.env.DSH_HOME);
 	let registry = null;
 	let registryReady = null;
@@ -288,7 +302,7 @@ export function createApi(ctx, rawConfig) {
 		workspace,
 		registryPath,
 		lastError: null,
-		calls: { status: 0, create: 0, deliver: 0, discard: 0, workspaces: 0 }
+		calls: { status: 0, create: 0, deliver: 0, discard: 0, session: 0, workspaces: 0 }
 	};
 
 	/** Load the registry once, lazily, and remember the failure rather than retrying. */
@@ -319,6 +333,25 @@ export function createApi(ctx, rawConfig) {
 		const current = await ensureRegistry();
 		registry = dropWorktree(current, repoKeyValue, branch);
 		await saveRegistry(registryPath, registry, { onWarn: warn });
+	};
+
+	/**
+	 * Remember which session is working in an existing worktree.
+	 *
+	 * Needed because the browser may be the side that creates that session (it has
+	 * to be: only there can the new Session be both registered and navigated to),
+	 * and the host would otherwise never learn its id — which is what the control's
+	 * "go back to that worktree" entry and the status payload read.
+	 */
+	const rememberSession = async (repoKeyValue, worktreePathValue, ownerSessionId) => {
+		if (typeof ownerSessionId !== 'string' || ownerSessionId === '') return null;
+		if (typeof worktreePathValue !== 'string' || worktreePathValue === '') return null;
+		const current = await ensureRegistry();
+		const entry = findByPath(current, repoKeyValue, worktreePathValue);
+		if (entry === null) return null;
+		registry = patchWorktree(current, repoKeyValue, entry.branch, { sessionId: ownerSessionId });
+		await saveRegistry(registryPath, registry, { onWarn: warn });
+		return entry.branch;
 	};
 
 	const withLock = async (key, operation) => {
@@ -376,17 +409,30 @@ export function createApi(ctx, rawConfig) {
 	/**
 	 * Create the worktree, and optionally start a session rooted in it.
 	 *
-	 * `open` defaults to FALSE and `requested` to true, which is the honest
-	 * reading of "the user asked for a worktree": every caller of this action is
-	 * a deliberate click or a `/worktree create`, never a speculative render. A
-	 * caller that only wants the directory on disk (a test, a script) passes
-	 * `requested: false`.
+	 * `session` says WHO starts that session, and the distinction is the whole
+	 * reason this plugin used to feel broken:
+	 *
+	 *   `'client'`  the BROWSER starts it. It is the only side that can register
+	 *               the Workspace in its own projection and drive the sidebar and
+	 *               the main area, and a session IT creates is addressable
+	 *               synchronously — a session created here is unknown to the
+	 *               client until a later list refresh, so the navigation that
+	 *               follows it throws `sessions.retain: unknown session`.
+	 *   `'host'`    this process starts it, for the tool and the command, where
+	 *               no browser exists at all.
+	 *   `'none'`    the directory only (a test, a script).
+	 *
+	 * `open` is the older spelling of the same decision, still honoured: every
+	 * caller of this action is a deliberate click or an explicit `/worktree
+	 * create`, never a speculative render.
 	 */
-	const createAction = async ({ cwd, sessionId, open, requested = true } = {}) => {
+	const createAction = async ({ cwd, sessionId, session, open, requested = true } = {}) => {
 		if (!config.enabled) return { ok: false, reason: 'disabled' };
 		const directory = safeDirectory(cwd);
 		if (directory === null) return { ok: false, reason: 'invalid-path' };
-		const openSessionNow = typeof open === 'boolean' ? open : requested === true;
+		const seat = session === 'host' || session === 'client' || session === 'none'
+			? session
+			: (typeof open === 'boolean' ? (open ? 'host' : 'none') : (requested === true ? 'host' : 'none'));
 
 		const state0 = await workspace.inspect(directory);
 		if (state0.repo.present !== true) return { ok: false, reason: state0.repo.reason };
@@ -406,13 +452,20 @@ export function createApi(ctx, rawConfig) {
 				throw error;
 			}
 
+			// Give the new directory a Workspace record before anything is asked to
+			// display it: DSH's sidebar groups a Session by the registered Workspace
+			// whose path IS the Session's directory, so without this the worktree's
+			// session lands in "Ungrouped" and only appears after a restart rebuilds
+			// the grouping from session history.
+			const registered = await ensureWorkspace(ctx, created.path);
+
 			// The session is started FIRST, so the record can name the session that
 			// will actually be working in this worktree. Recording the CALLER's
 			// session instead — the one that asked for the worktree — would make
 			// "open that worktree's session" navigate back to where the user already
 			// was, which is the bug this ordering exists to prevent.
 			let opened = null;
-			if (openSessionNow) opened = await openSession(ctx, created.path, state0.repoRoot, warn);
+			if (seat === 'host') opened = await openSession(ctx, created.path, state0.repoRoot, warn);
 
 			const ownerSession = opened !== null && typeof opened.sessionId === 'string' && opened.sessionId !== ''
 				? opened.sessionId
@@ -433,7 +486,7 @@ export function createApi(ctx, rawConfig) {
 			};
 			await remember(key, record);
 
-			log(`dsh-local-worktree: created ${created.path} on ${created.branch}${opened?.sessionId ? ` (session ${opened.sessionId})` : ''}`);
+			log(`dsh-local-worktree: created ${created.path} on ${created.branch}${opened?.sessionId ? ` (session ${opened.sessionId})` : ` (session: ${seat})`}`);
 			return {
 				ok: true,
 				created: {
@@ -442,10 +495,51 @@ export function createApi(ctx, rawConfig) {
 					base: created.base,
 					reused: created.reused === true
 				},
+				// What the caller needs to make the new worktree reachable: the path
+				// for its own Workspace registration and navigation, and whether this
+				// side already registered it.
+				workspace: {
+					path: created.path,
+					layout: config.worktreeLayout,
+					registered: registered.ok === true,
+					workspaceId: registered.workspaceId ?? null
+				},
 				session: opened,
+				seat,
 				text: `已创建 worktree：${created.path}（分支 ${created.branch}） / worktree created: ${created.path} (branch ${created.branch})`
 			};
 		});
+	};
+
+	/**
+	 * Start a session in an existing worktree (or repository) and remember it.
+	 *
+	 * This is the browser's fallback: when the client's own `workspaces` /
+	 * `sessions` services are unavailable it cannot create the session itself, so
+	 * it asks here — which is exactly the older behaviour, kept as the degradation
+	 * path rather than as the main one.
+	 */
+	const openSessionAction = async ({ cwd, sessionId } = {}) => {
+		if (!config.enabled) return { ok: false, reason: 'disabled' };
+		const directory = safeDirectory(cwd);
+		if (directory === null) return { ok: false, reason: 'invalid-path' };
+
+		const state0 = await workspace.inspect(directory);
+		if (state0.repo.present !== true) return { ok: false, reason: state0.repo.reason };
+		const target = state0.worktree !== null && state0.worktree.present === true ? state0.worktree.path : state0.repoRoot;
+		if (typeof target !== 'string' || target === '') return { ok: false, reason: 'worktree-missing' };
+
+		const opened = await openSession(ctx, target, state0.repoRoot, warn);
+		if (opened.ok !== true) return opened;
+		if (state0.repoKey !== null) await rememberSession(state0.repoKey, target, opened.sessionId);
+
+		const seat = typeof sessionId === 'string' && sessionId !== '' ? sessionId : null;
+		log(`dsh-local-worktree: session ${opened.sessionId} opened in ${target}${seat === null ? '' : ` (asked by ${seat})`}`);
+		return {
+			ok: true,
+			session: opened,
+			text: `已在 ${target} 打开新会话 / new session opened in ${target}`
+		};
 	};
 
 	/** Merge the worktree's commits into the branch it came from. */
@@ -601,6 +695,7 @@ export function createApi(ctx, rawConfig) {
 	api.deliverAction = deliverAction;
 	api.discardAction = discardAction;
 	api.openAction = openAction;
+	api.openSessionAction = openSessionAction;
 	api.workspacesAction = workspacesAction;
 
 	return api;
@@ -626,6 +721,38 @@ async function gitRootOf(path) {
 		const parent = dirname(current);
 		if (parent === current) return null;
 		current = parent;
+	}
+}
+
+/**
+ * Register a directory as a DSH Workspace, on the host.
+ *
+ * Best-effort, and deliberately not the only path: the Web client does the same
+ * thing through its own `workspaces` service immediately before it navigates,
+ * which is the copy that must also update the CLIENT projection (a Workspace
+ * registered here reaches the sidebar through the projection stream, a few
+ * milliseconds later). This call is what gives the surfaces without a browser —
+ * the `git_worktree` tool and `/worktree create` — the same grouping, so a
+ * worktree never sits in the sidebar's "Ungrouped" bucket.
+ *
+ * `resolveByPath` first, because registration is idempotent by canonical path and
+ * a second call for the same directory must not be an error.
+ */
+async function ensureWorkspace(ctx, path) {
+	const registry = ctx.get?.('workspaceRegistry');
+	if (registry === undefined || registry === null) return { ok: false, reason: 'workspace-api-unavailable' };
+	try {
+		const existing = typeof registry.resolveByPath === 'function' ? await registry.resolveByPath(path) : undefined;
+		if (existing !== undefined && existing !== null) {
+			return { ok: true, created: false, workspaceId: existing.id ?? null };
+		}
+		const created = await registry.create(path);
+		return { ok: true, created: true, workspaceId: created?.id ?? null };
+	} catch (error) {
+		// The worktree is on disk and remembered either way; only its sidebar
+		// grouping is lost, which is not worth failing a click over.
+		ctx.logger?.warn?.(`dsh-local-worktree: could not register ${path} as a workspace: ${error?.message ?? error}`);
+		return { ok: false, reason: 'workspace-create-failed', detail: String(error?.message ?? error) };
 	}
 }
 
@@ -702,15 +829,25 @@ function attachRoutes(ctx, api) {
 	route(ROUTES.create, 'POST', async (req) => {
 		api.state.calls.create += 1;
 		const body = await readBody(req);
-		// `open` defaults on: every caller of this route is a deliberate click, and
-		// the whole point of the worktree is the session that goes with it. A
-		// caller that only wants the directory passes `open: false` explicitly.
+		// `session` defaults to 'client': the browser is the caller, and only it can
+		// register the Workspace in its own projection and navigate to the new
+		// Session. A caller that wants this side to start the Session (a script, or
+		// the browser's own fallback) passes 'host'.
 		return api.createAction({
 			cwd: body.cwd,
 			sessionId: body.sessionId ?? null,
-			open: body.open === undefined ? true : body.open === true
+			session: body.session === undefined ? 'client' : body.session,
+			open: body.open === undefined ? undefined : body.open === true
 		});
 	}, 'dsh-local-worktree: POST create');
+
+	route(ROUTES.session, 'POST', async (req) => {
+		api.state.calls.session = (api.state.calls.session ?? 0) + 1;
+		const body = await readBody(req);
+		// The browser's degradation path: it could not create the Session itself
+		// (no `workspaces`/`sessions` client service), so it asks here.
+		return api.openSessionAction({ cwd: body.cwd, sessionId: body.sessionId ?? null });
+	}, 'dsh-local-worktree: POST session');
 
 	route(ROUTES.deliver, 'POST', async (req) => {
 		api.state.calls.deliver += 1;
@@ -747,6 +884,7 @@ function attachRoutes(ctx, api) {
 			autoCommit: api.config.autoCommit,
 			autoCleanup: api.config.autoCleanup,
 			registerTool: api.config.registerTool,
+			worktreeLayout: api.config.worktreeLayout,
 			gitTimeoutMs: api.config.gitTimeoutMs
 		}
 	}));
@@ -768,7 +906,7 @@ function attachTool(ctx, api) {
 		name: 'git_worktree',
 		description: [
 			'Create and deliver a git worktree, entirely locally (no remote, no network).',
-			'"create" cuts a linked worktree beside the repository on its own dsh/wt/* branch and starts a session rooted there.',
+			'"create" cuts a linked worktree under the repository on its own dsh/wt/* branch, registers its directory as a Workspace, and starts a session rooted there.',
 			'"status" reports whether the current directory is inside such a worktree and how far it has drifted.',
 			'"deliver" merges the worktree\'s commits back into the branch it was cut from, in the main working tree: it fast-forwards when that branch has not moved and creates a merge commit when it has.',
 			'A conflict is detected before anything is written and reported with the paths involved; the main working tree is never left half-merged.'
@@ -789,7 +927,9 @@ function attachTool(ctx, api) {
 				? args.cwd
 				: (execution?.cwd ?? execution?.agent?.cwd ?? process.cwd());			const action = String(args?.action ?? 'status');
 			const answer = action === 'create'
-				? await api.createAction({ cwd, open: true })
+				// 'host': an agent asking for a worktree has no browser to hand the
+				// Session to, so this side starts it and reports its id.
+				? await api.createAction({ cwd, session: 'host' })
 				: action === 'deliver'
 					? await api.deliverAction({ cwd, message: args?.message, cleanup: args?.cleanup })
 					: action === 'discard'
@@ -833,7 +973,8 @@ function attachCommand(ctx, api) {
 			};
 		}
 		if (raw === 'create') {
-			const answer = await api.createAction({ cwd, open: true });
+			// 'host': a typed command has no browser to hand the Session to.
+			const answer = await api.createAction({ cwd, session: 'host' });
 			if (answer.ok !== true) return { kind: 'error', text: answer.reasonText ?? reasonText(answer.reason, { lang: 'both' }) };
 			return { kind: 'success', text: answer.text + (answer.session?.sessionId ? `\n新会话 / new session: ${answer.session.sessionId}` : '') };
 		}
@@ -890,6 +1031,7 @@ export function install(ctx, rawConfig) {
 				version: 1,
 				status: (cwd) => api.statusOf(cwd),
 				create: (options) => api.createAction(options),
+				openSession: (options) => api.openSessionAction(options),
 				deliver: (options) => api.deliverAction(options),
 				discard: (options) => api.discardAction(options),
 				registryPath: api.registryPath,

@@ -10,10 +10,10 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { basename } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 
 import { createApi, normalizeConfig, ROUTES, safeDirectory, screenRequest } from '../src/index.js';
@@ -49,6 +49,19 @@ function fakeContext({ withTool = true, withCommand = true, withSession = true, 
 	const commands = [];
 	const sessions = [];
 	const warnings = [];
+	// Every directory this plugin asked the workspace registry to register. The
+	// sidebar only groups a Session under a Workspace whose path IS its directory,
+	// so this list is what "the worktree appears in the sidebar" reduces to.
+	const registeredWorkspaces = [];
+	const entries = workspaces.map((entry) => ({
+		id: `ws-${entry.path}`,
+		path: entry.path,
+		title: entry.title ?? entry.path,
+		createdAt: '',
+		updatedAt: '',
+		sessionIds: []
+	}));
+	const normalize = (value) => String(value ?? '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 
 	const ctx = {
 		logger: {
@@ -69,14 +82,23 @@ function fakeContext({ withTool = true, withCommand = true, withSession = true, 
 			if (name === 'commands') return withCommand ? { register: (definition) => { commands.push(definition); return () => {}; } } : undefined;
 			if (name === 'workspaceRegistry') {
 				return {
-					list: () => workspaces.map((entry) => ({
-						id: `ws-${entry.path}`,
-						path: entry.path,
-						title: entry.title ?? entry.path,
-						createdAt: '',
-						updatedAt: '',
-						sessionIds: []
-					}))
+					list: () => entries.slice(),
+					// The real registry resolves by CANONICAL path and returns undefined when
+					// the directory has no record yet; the plugin calls both this way.
+					resolveByPath: async (path) => entries.find((entry) => normalize(entry.path) === normalize(path)),
+					create: async (path) => {
+						registeredWorkspaces.push(path);
+						const entity = {
+							id: `ws-${path}`,
+							path,
+							title: basename(path),
+							createdAt: '',
+							updatedAt: '',
+							sessionIds: []
+						};
+						entries.push(entity);
+						return entity;
+					}
 				};
 			}
 			if (name === 'sessionController') {
@@ -91,7 +113,7 @@ function fakeContext({ withTool = true, withCommand = true, withSession = true, 
 		},
 		reflect: undefined
 	};
-	return { ctx, routes, tools, commands, sessions, warnings };
+	return { ctx, routes, tools, commands, sessions, warnings, registeredWorkspaces };
 }
 
 /** One route call, as the button makes it. */
@@ -205,7 +227,9 @@ test('GET status in a fresh repository offers CREATE and names the worktree cont
 	assert.equal(answer.body.repo.branch, 'main');
 	// The CONTAINER is the stable part: each worktree inside it carries a fresh id
 	// of its own, so promising one exact path would be wrong by the second click.
-	assert.ok(answer.body.worktreeContainer.endsWith('_worktrees'), 'the UI is told where worktrees land');
+	// The default layout is `inside`, which is what lets the sidebar nest the
+	// worktree inside the repository's own group.
+	assert.equal(answer.body.worktreeContainer, join(root, '.dsh-worktrees'), 'the UI is told where worktrees land');
 	assert.deepEqual(answer.body.myWorktrees, [], 'this plugin has made none yet');
 	assert.equal(answer.body.worktree, null);
 });
@@ -274,7 +298,7 @@ test('an existing worktree of this plugin never disables CREATE, and is offered 
 	const root = await makeRepo({ name: 'impl-existing' });
 	const harness = await mount();
 
-	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root, sessionId: 'session-abc' } });
+	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root, sessionId: 'session-abc', session: 'host' } });
 	assert.equal(created.body.ok, true);
 
 	const status = await call(harness, ROUTES.status, { query: { cwd: root } });
@@ -350,7 +374,7 @@ test('the whole journey through the routes: create, status, deliver', async () =
 	const root = await makeRepo({ name: 'impl-journey' });
 	const harness = await mount();
 
-	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root, sessionId: 'session-abc' } });
+	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root, sessionId: 'session-abc', session: 'host' } });
 	assert.equal(created.body.ok, true);
 	assert.equal(created.body.created.base, 'main');
 	assert.equal(created.body.created.reused, false);
@@ -364,7 +388,7 @@ test('the whole journey through the routes: create, status, deliver', async () =
 
 	// A second press is a SECOND worktree, each with its own session. Answering it
 	// with the first worktree would read as "the button did nothing".
-	const again = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root, sessionId: 'session-xyz' } });
+	const again = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root, sessionId: 'session-xyz', session: 'host' } });
 	assert.equal(again.body.ok, true);
 	assert.notEqual(again.body.created.path, worktreePath, 'two presses must be two directories');
 	assert.notEqual(again.body.created.branch, created.body.created.branch, 'two worktrees must be two branches');
@@ -602,10 +626,94 @@ test('a composition without a web server, tool or command still mounts', async (
 test('a failing session API does not fail the creation', async () => {
 	const root = await makeRepo({ name: 'impl-nosession' });
 	const harness = await mount({ withSession: false });
-	const answer = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root } });
+	const answer = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root, session: 'host' } });
 	assert.equal(answer.body.ok, true, 'the worktree exists and is remembered');
 	assert.equal(answer.body.session.ok, false);
 	assert.equal(answer.body.session.reason, 'session-api-unavailable');
+});
+
+test('POST create hands the session to the client and registers the directory as a workspace', async () => {
+	const root = await makeRepo({ name: 'impl-client-seat' });
+	const harness = await mount();
+
+	// The button's own request: no `session`, because the browser is the caller and
+	// only the browser can register the row it groups by and show the new session.
+	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root, sessionId: 'session-caller' } });
+	assert.equal(created.body.ok, true);
+	assert.equal(created.body.seat, 'client');
+	assert.equal(created.body.session, null, 'the browser starts the session; the host does not');
+	assert.deepEqual(harness.sessions, [], 'no host-side session was created');
+
+	// Registration on the host side is what gives the non-browser surfaces (the tool
+	// and `/worktree create`) the same sidebar grouping.
+	assert.deepEqual(harness.registeredWorkspaces, [created.body.created.path]);
+	assert.equal(created.body.workspace.path, created.body.created.path);
+	assert.equal(created.body.workspace.registered, true);
+	assert.equal(created.body.workspace.layout, 'inside');
+
+	// A second press is a second directory, registered in its own right.
+	const again = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root } });
+	assert.equal(harness.registeredWorkspaces.length, 2);
+	assert.notEqual(again.body.created.path, created.body.created.path);
+});
+
+test('POST session starts the host-side session in the worktree and remembers its id', async () => {
+	const root = await makeRepo({ name: 'impl-session-route' });
+	const harness = await mount();
+	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root } });
+	const worktreePath = created.body.created.path;
+
+	// The browser's degradation path: it could not start the session itself.
+	const opened = await call(harness, ROUTES.session, { method: 'POST', body: { cwd: worktreePath, sessionId: 'session-caller' } });
+	assert.equal(opened.body.ok, true);
+	assert.equal(opened.body.session.cwd, worktreePath);
+	assert.equal(harness.sessions.length, 1);
+
+	// The id is remembered, so "go back to that worktree" has something to open even
+	// when the browser was the side that started it.
+	const status = await call(harness, ROUTES.status, { query: { cwd: root } });
+	assert.equal(status.body.myWorktrees[0].sessionId, opened.body.session.sessionId);
+});
+
+test('the inside layout nests the worktree under the repository and keeps git blind to it', async () => {
+	const root = await makeRepo({ name: 'impl-inside' });
+	const harness = await mount({}, { worktreeLayout: 'inside' });
+	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root } });
+	const worktreePath = created.body.created.path;
+
+	// Nesting IS the feature: the sidebar nests a Workspace under its nearest
+	// registered ancestor directory, so only a path under the repository can appear
+	// inside the repository's own group.
+	assert.equal(worktreePath.startsWith(`${root}\\`) || worktreePath.startsWith(`${root}/`), true,
+		'the worktree lives under the repository');
+	assert.equal(basename(dirname(worktreePath)), '.dsh-worktrees');
+
+	// …and it must stay invisible to the main tree's git, or the next `git add -A`
+	// there would commit an entire parallel checkout.
+	const status = await git(root, ['status', '--porcelain']);
+	assert.equal(status.stdout.trim(), '', 'the container does not dirty the repository');
+	const exclude = await readFile(join(root, '.git', 'info', 'exclude'), 'utf8');
+	assert.match(exclude, /^\.dsh-worktrees\/$/m);
+
+	// It is still a real worktree git knows about, on the main tree's HEAD.
+	const listed = await git(root, ['worktree', 'list', '--porcelain']);
+	assert.match(listed.stdout, /\.dsh-worktrees/);
+
+	// Discarding it takes the container with it, so the repository is left as found.
+	const discarded = await call(harness, ROUTES.discard, { method: 'POST', body: { cwd: worktreePath } });
+	assert.equal(discarded.body.ok, true);
+	assert.equal(existsSync(join(root, '.dsh-worktrees')), false, 'an emptied container is not left behind');
+});
+
+test('the sibling layout is unchanged, and is one configuration away', async () => {
+	const root = await makeRepo({ name: 'impl-sibling' });
+	const harness = await mount({}, { worktreeLayout: 'sibling' });
+	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root } });
+	assert.equal(basename(dirname(created.body.created.path)), `${basename(root)}_worktrees`);
+	assert.equal(created.body.workspace.layout, 'sibling');
+	const excludePath = join(root, '.git', 'info', 'exclude');
+	const siblingExclude = existsSync(excludePath) ? await readFile(excludePath, 'utf8') : '';
+	assert.equal(siblingExclude.includes('.dsh-worktrees'), false, 'the sibling layout excludes nothing');
 });
 
 test('a broken request body is answered, not crashed', async () => {

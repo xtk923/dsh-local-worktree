@@ -22,19 +22,27 @@
  * The state machine, which is the whole UX:
  *
  *   no session working directory → list the known git repositories and let the
- *                                  user pick one; picking creates a worktree and
- *                                  a session rooted in it, THEN NAVIGATES to that
- *                                  session
+ *                                  user pick one; picking creates a worktree,
+ *                                  registers it as a Workspace, starts a session
+ *                                  inside it, THEN SHOWS that session
  *   in a repository             → "创建 worktree · <branch>"
  *   in one of its worktrees     → "合并回 <branch> · N"
  *   not a repository            → render nothing at all
  *
- * Navigation uses the shipped client service `uiWorkspace.openSession(id)`, which
- * is exactly what the sidebar's own "New session" button and every session-row
- * click call. It is not an internal trick: making a Session visible in the
- * Conversation panel is a CLIENT concern, and simply creating one on the Host is
- * not enough — a session that appears out of band is merged into the sidebar list
- * and nothing more, which is why a user had to go and find it.
+ * Navigation is the two calls the sidebar makes for ITSELF, in this order:
+ * `workspaces.create({ path })` registers the new worktree directory as a DSH
+ * Workspace — which is what puts it in the sidebar at all, and what makes its
+ * session group under it instead of landing in "Ungrouped" — and then
+ * `uiWorkspace.openWorkspace(id)` starts a blank session whose working directory
+ * is that workspace and selects it, which is exactly the sidebar's own "New
+ * session" button.
+ *
+ * The order is not a shortcut around the Host; it is the only one that works. A
+ * session started ON the Host is unknown to this client until a later list
+ * refresh, and `sessions.retain()` — the call navigation makes — throws
+ * `unknown session` for an id the browser has never seen, so a jump issued right
+ * after creating one silently does nothing. A session the CLIENT creates is
+ * addressable the moment that call resolves.
  *
  * What it deliberately does NOT do:
  *
@@ -57,36 +65,93 @@ window.__ModuleLoader__.load({
 		const API = 'api/dsh-local-worktree';
 
 		/**
-		 * A session id whose navigation this module already attempted.
+		 * The client services this control needs, captured in `apply`.
 		 *
-		 * Module-level, so a re-render never navigates twice, while a browser reload
-		 * starts clean.
+		 * `workspaces` registers the new directory as a DSH Workspace — which is
+		 * what puts it in the sidebar at all, and what makes its session group
+		 * under it instead of landing in "Ungrouped" — `sessions` is not used
+		 * directly here (it is what `uiWorkspace.openWorkspace` calls), and
+		 * `uiWorkspace` is the navigation surface.
 		 */
-		const navigated = new Set();
-
-		/** The client's session-navigation service, captured in `apply`. */
-		let uiWorkspace = null;
+		const services = { uiWorkspace: null, workspaces: null };
 
 		/**
 		 * Show a Session in the Conversation panel.
 		 *
 		 * `uiWorkspace.openSession(id)` is the shipped navigation action — the same
-		 * call the sidebar's "New session" button and every session-row click make.
-		 * It is best-effort here on purpose: a composition without the service must
-		 * lose the automatic jump, not the control that created the worktree, and
-		 * the result is returned so the caller can say which of the two happened.
+		 * call the sidebar's own session-row click makes. It is best-effort here on
+		 * purpose: a composition without the service must lose the automatic jump,
+		 * not the control that created the worktree, and the result is returned so
+		 * the caller can say which of the two happened.
+		 *
+		 * Note what it CANNOT do: `sessions.retain()` — the call this navigation
+		 * makes — throws `unknown session` for an id the client has never seen, so a
+		 * Session started on the host is not navigable until a later list refresh
+		 * teaches the client about it. That is why the main path below creates the
+		 * Session from here instead.
 		 */
 		function openInUi(sessionId) {
 			if (typeof sessionId !== 'string' || sessionId === '') return 'no-session';
-			if (navigated.has(sessionId)) return 'already';
-			if (uiWorkspace === null || typeof uiWorkspace.openSession !== 'function') return 'unavailable';
+			const workspace = services.uiWorkspace;
+			if (workspace === null) return 'unavailable';
 			try {
-				uiWorkspace.openSession(sessionId);
-				navigated.add(sessionId);
+				// No "already navigated" guard: this is only ever called from a click, and
+				// revisiting the same session later is a legitimate thing to ask for.
+				workspace.openSession(sessionId);
 				return 'opened';
 			} catch {
 				return 'failed';
 			}
+		}
+
+		/** Two directory paths that name the same place, sparing case and separators. */
+		function sameDir(left, right) {
+			const norm = (value) => String(value ?? '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+			return norm(left) !== '' && norm(left) === norm(right);
+		}
+
+		/**
+		 * Put the user INTO a worktree that was just created.
+		 *
+		 * Two calls, both owned by the browser, and together they are the whole fix
+		 * for "the worktree is created but nothing happens":
+		 *
+		 *   `workspaces.create({ path })`  registers the directory on the Host
+		 *     (idempotent — it resolves by canonical path first) and echoes the row
+		 *     into the CLIENT projection immediately, so the sidebar has it before
+		 *     anything tries to navigate to it.
+		 *   `uiWorkspace.openWorkspace(id)` is exactly what the sidebar's own "New
+		 *     session" button does: it starts a blank Session whose working
+		 *     directory is the workspace path AND selects it, so the jump cannot
+		 *     race the session catalog the way a host-created Session does.
+		 *
+		 * The stage is reported rather than a bare boolean, because the caller's
+		 * recovery differs: nothing was created for `no-services`/`create-failed`,
+		 * while `navigate-failed` may already have a Session the user can open by
+		 * hand.
+		 */
+		async function enterWorktree(path) {
+			if (typeof path !== 'string' || path === '') return { ok: false, stage: 'create-failed' };
+			const workspaces = services.workspaces;
+			const navigation = services.uiWorkspace;
+			if (workspaces === null || typeof workspaces.create !== 'function') return { ok: false, stage: 'no-services' };
+			if (navigation === null || typeof navigation.openWorkspace !== 'function') return { ok: false, stage: 'no-services' };
+			let workspace;
+			try {
+				workspace = await workspaces.create({ path });
+			} catch (error) {
+				console.warn('dsh-local-worktree: the worktree directory was not registered as a workspace:', error);
+				return { ok: false, stage: 'create-failed' };
+			}
+			const workspaceId = workspace && typeof workspace.workspaceId === 'string' ? workspace.workspaceId : '';
+			if (workspaceId === '') return { ok: false, stage: 'create-failed' };
+			try {
+				await navigation.openWorkspace(workspaceId);
+			} catch (error) {
+				console.warn('dsh-local-worktree: the workspace is registered but its session was not opened:', error);
+				return { ok: false, stage: 'navigate-failed', workspaceId };
+			}
+			return { ok: true, stage: 'done', workspaceId };
 		}
 
 		/**
@@ -339,11 +404,47 @@ window.__ModuleLoader__.load({
 				const answer = await call(path, { method: 'POST', body: { ...body, ...(cwd ? { cwd } : {}) } });
 				if (!mounted.current) return;
 				if (answer === null) { setPhase('idle'); return; }
+				if (answer.ok === true) {
+					// `done` may be async: entering the new worktree is a navigation, and
+					// its outcome decides what the user is told.
+					const text = await done(answer);
+					if (mounted.current) setNotice(text);
+				} else {
+					setNotice(`${answer.reasonText || answer.reason || 'failed'}${answer.detail ? `（${answer.detail}）` : ''}`);
+				}
 				setPhase('idle');
-				if (answer.ok === true) setNotice(done(answer));
-				else setNotice(`${answer.reasonText || answer.reason || 'failed'}${answer.detail ? `（${answer.detail}）` : ''}`);
 				await refresh();
 			}, [cwd, refresh]);
+
+			/**
+			 * The worktree exists — get the user into it, and report what happened.
+			 *
+			 * The main path is entirely client-side: register the directory as a
+			 * Workspace, then let `openWorkspace` start a Session in it and select it.
+			 * Only when this composition has no service to do that does the host get
+			 * asked to start the session, exactly as it used to.
+			 */
+			const afterCreate = React.useCallback(async (answer) => {
+				const where = answer.created && answer.created.path ? answer.created.path : '';
+				const placed = where === '' ? { ok: false, stage: 'create-failed' } : await enterWorktree(where);
+				if (placed.ok === true) {
+					return `${where}\n已进入该 worktree 的新会话 / now in the worktree's new session`;
+				}
+				if (placed.stage === 'navigate-failed') {
+					return `${where}\nworktree 与工作区已就绪，请到左侧列表打开它的会话 / the worktree and its workspace are ready — open its session from the sidebar`;
+				}
+				// Degradation path: no `workspaces`/`sessions` on this client, so the
+				// host starts the session the way it always did. The jump may still be
+				// too early for this client to know the id — say so instead of pretending.
+				const asked = where === ''
+					? null
+					: await call('session', { method: 'POST', body: { cwd: where, sessionId: sessionId ?? null } });
+				const hostSession = asked !== null && asked.ok === true && asked.session ? asked.session.sessionId : null;
+				if (hostSession === null) return `${where}\nworktree 已就绪 / the worktree is ready`;
+				return openInUi(hostSession) === 'opened'
+					? `${where}\n已切换到该 worktree 的新会话 / switched to the new session in the worktree`
+					: `${where}\nworktree 已就绪，请到左侧会话列表打开它 / the worktree is ready — open its session from the sidebar (${hostSession})`;
+			}, [sessionId]);
 
 			/**
 			 * This plugin's other live worktrees for the repository.
@@ -359,6 +460,28 @@ window.__ModuleLoader__.load({
 			}, [status]);
 
 			/**
+			 * The session working in one of this plugin's other worktrees.
+			 *
+			 * The CLIENT's Workspace projection answers first, by path: a session the
+			 * browser started is registered there at once, while the host's remembered
+			 * id (the fallback) only exists once the host has been told about it. The
+			 * projection is also the authority the sidebar groups by, so its answer is
+			 * the one that is certain to be a row the user can actually see.
+			 */
+			const sessionOfWorktree = React.useCallback((record) => {
+				const workspaces = services.workspaces;
+				const items = workspaces !== null && workspaces.list && typeof workspaces.list.getSnapshot === 'function'
+					? workspaces.list.getSnapshot().items
+					: null;
+				if (Array.isArray(items)) {
+					const match = items.find((item) => item && sameDir(item.path, record.path));
+					const first = match !== undefined && Array.isArray(match.sessionIds) ? match.sessionIds[0] : undefined;
+					if (typeof first === 'string' && first !== '') return first;
+				}
+				return typeof record.sessionId === 'string' && record.sessionId !== '' ? record.sessionId : null;
+			}, []);
+
+			/**
 			 * Start a worktree session in a chosen repository, then GO there.
 			 *
 			 * The jump is the point: without it the new session is only a row in the
@@ -371,23 +494,10 @@ window.__ModuleLoader__.load({
 				setNotice(null);
 				const answer = await call('create', { method: 'POST', body: { cwd: path, sessionId: sessionId ?? null } });
 				if (!mounted.current) return;
+				if (answer !== null && answer.ok === true) setNotice(await afterCreate(answer));
+				else if (answer !== null) setNotice(`${answer.reasonText || answer.reason || 'failed'}${answer.detail ? `（${answer.detail}）` : ''}`);
 				setPhase('idle');
-				if (answer !== null && answer.ok === true) {
-					const where = answer.created ? answer.created.path : '';
-					const newSession = answer.session && answer.session.sessionId ? answer.session.sessionId : null;
-					const move = openInUi(newSession);
-					const next = move === 'opened'
-						? '已切换到该 worktree 的新会话 / switched to the new session in the worktree'
-						: move === 'already'
-							? '该 worktree 的会话已经是当前会话 / that session is already the current one'
-							: newSession !== null
-								? `worktree 已就绪，请到左侧会话列表打开它 / the worktree is ready — open its session from the sidebar (${newSession})`
-								: 'worktree 已就绪 / the worktree is ready';
-					setNotice(`${where}\n${next}`);
-				} else if (answer !== null) {
-					setNotice(`${answer.reasonText || answer.reason || 'failed'}${answer.detail ? `（${answer.detail}）` : ''}`);
-				}
-			}, [sessionId]);
+			}, [sessionId, afterCreate]);
 
 			if (cwd && status !== null && status.repo && status.repo.present !== true) return null;
 
@@ -411,19 +521,7 @@ window.__ModuleLoader__.load({
 					});
 					return;
 				}
-				void run('create', { sessionId }, (answer) => {
-					const where = answer.created ? answer.created.path : '';
-					const newSession = answer.session && answer.session.sessionId ? answer.session.sessionId : null;
-					const move = openInUi(newSession);
-					const next = move === 'opened'
-						? '已切换到该 worktree 的新会话 / switched to the new session in the worktree'
-						: move === 'already'
-							? '该 worktree 的会话已经是当前会话 / that session is already the current one'
-							: newSession !== null
-								? `worktree 已就绪，请到左侧会话列表打开它 / the worktree is ready — open its session from the sidebar (${newSession})`
-								: 'worktree 已就绪 / the worktree is ready';
-					return `${where}\n${next}`;
-				});
+				void run('create', { sessionId }, afterCreate);
 			};
 
 			const option = (key, label, sub, onClick, opt) => h('button', {
@@ -471,7 +569,7 @@ window.__ModuleLoader__.load({
 				h('div', { key: 'head', className: 'dshwt-head' }, '当前目录 / this directory'),
 				option('create', '创建 worktree / create worktree',
 					status && status.repo && status.repo.root ? shortPath(status.repo.root) : null,
-					() => { setMenu(false); void run('create', { sessionId }, (answer) => (answer.created && answer.created.path) || '已创建 / created'); },
+					() => { setMenu(false); void run('create', { sessionId }, afterCreate); },
 					{ disabled: !status || !status.repo || status.repo.usable !== true }),
 				option('deliver', '合并回原分支 / deliver to the base branch',
 					status && status.repo ? status.repo.branch : null,
@@ -494,11 +592,12 @@ window.__ModuleLoader__.load({
 					shortPath(record.path),
 					() => {
 						setMenu(false);
-						if (record.sessionId === null) {
+						const target = sessionOfWorktree(record);
+						if (target === null) {
 							setNotice(`worktree: ${record.path}\n没有记录到它的会话，请到左侧会话列表打开 / no session is on record — open it from the sidebar`);
 							return;
 						}
-						const move = openInUi(record.sessionId);
+						const move = openInUi(target);
 						setNotice(move === 'opened'
 							? '已切换到该 worktree 的会话 / switched to that worktree\'s session'
 							: '无法自动切换，请到左侧会话列表打开它 / could not switch automatically — open it from the sidebar');
@@ -555,16 +654,19 @@ window.__ModuleLoader__.load({
 
 		return {
 			name: 'dsh-local-worktree',
-			// `uiWorkspace` is what makes the created session VISIBLE: creating one on
-			// the Host only adds a sidebar row. Declaring it parks this plugin until
-			// the service exists, which every shipped Web composition provides
-			// (`@deepseek-ai/dsh-client-ui-workspace`), and the facade above still
-			// degrades if it is ever missing.
-			inject: ['slots', 'uiWorkspace'],
+			// `uiWorkspace` is what makes the created session VISIBLE, `workspaces` is
+			// what puts the new worktree directory in the sidebar at all, and
+			// `sessions` is what `openWorkspace` starts the session through. All three
+			// are declared so this plugin waits for them instead of racing them, and
+			// every shipped Web composition provides them
+			// (`@deepseek-ai/dsh-client-ui-workspace`); the code above still degrades
+			// to host-side session creation if one is ever missing.
+			inject: ['slots', 'uiWorkspace', 'workspaces', 'sessions'],
 			apply(ctx) {
 				// Captured once, guarded at the call site: a missing service must cost
 				// the navigation, never the control.
-				uiWorkspace = ctx.uiWorkspace ?? ctx.get?.('uiWorkspace') ?? null;
+				services.uiWorkspace = ctx.uiWorkspace ?? ctx.get?.('uiWorkspace') ?? null;
+				services.workspaces = ctx.workspaces ?? ctx.get?.('workspaces') ?? null;
 				// ONE seat, deliberately. `conversation.input.left` is the composer
 				// toolbar: ambient, so it exists before the first message, and present in
 				// every session. Registering a second seat is what put two copies of this

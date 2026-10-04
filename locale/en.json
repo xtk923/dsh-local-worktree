@@ -1,4 +1,4 @@
 {
 	"title": "Git Worktree",
-	"description": "One-click git worktree: isolate the work in a linked worktree, then merge its commits back into the branch it came from — local git only, no remote."
+	"description": "One-click git worktree: cut an isolated worktree under the repository, switch straight to its new session, then merge its commits back into the branch it came from — local git only, no remote."
 }

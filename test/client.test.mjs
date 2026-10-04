@@ -51,13 +51,22 @@ const THEME_TOKENS = new Set([
 	'--dsw-specific-sidebar-fill'
 ]);
 
-/** Load the bundle in a sandbox and return the definition it registers. */
-function loadDefinition() {
+/**
+ * Load the bundle in a sandbox and return the definition it registers.
+ *
+ * `extra` adds globals the bundle expects the PAGE to provide and this sandbox
+ * therefore lacks — `document` for the menu's Escape listener, `fetch` for the
+ * routes the control calls. They must go into the sandbox's own global: the
+ * bundle runs in a separate V8 context, so the test file's `globalThis` is not
+ * what its code sees.
+ */
+function loadDefinition(extra = {}) {
 	new Script(SOURCE, { filename: CLIENT_PATH });
 	let registered = null;
 	const sandbox = {
 		window: { __ModuleLoader__: { load: (definition) => { registered = definition; } } },
-		console
+		console,
+		...extra
 	};
 	runInContext(SOURCE, createContext(sandbox), { filename: CLIENT_PATH });
 	return registered;
@@ -153,13 +162,19 @@ test('the control is registered in exactly ONE seat, so nothing can be rendered 
 test('the declared injects cover what the component actually uses', () => {
 	const definition = loadDefinition();
 	const plugin = definition.factory(() => ({ createElement: () => null, Fragment: 'Fragment' }));
-	assert.deepEqual([...plugin.inject].sort(), ['slots', 'uiWorkspace']);
+	// `workspaces` is what registers the new directory as a Workspace (the row the
+	// sidebar groups by) and `sessions` is what `uiWorkspace.openWorkspace` starts
+	// the new session through, so both are declared and waited for.
+	assert.deepEqual([...plugin.inject].sort(), ['sessions', 'slots', 'uiWorkspace', 'workspaces']);
 	// The client manifest's own inject list is package names for ordering; it must
-	// name the workspace package that provides uiWorkspace.
-	assert.ok(
-		PACKAGE.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-workspace'),
-		'the workspace package is declared so its client half is activated first'
-	);
+	// name the packages whose client halves provide those three services.
+	for (const pkg of [
+		'@deepseek-ai/dsh-client-ui-workspace',
+		'@deepseek-ai/dsh-api-workspace-controller',
+		'@deepseek-ai/dsh-api-session-controller'
+	]) {
+		assert.ok(PACKAGE.dsh.client.inject.includes(pkg), `${pkg} is declared so its client half is activated first`);
+	}
 });
 
 test('no message is rendered from more than one place', () => {
@@ -185,4 +200,262 @@ test('a missing uiWorkspace costs the navigation, not the control', () => {
 	}));
 	assert.equal(registrations.length, 1);
 	assert.equal(registrations[0].name, 'conversation.input.left');
+});
+
+/* --------------------------------------------------- the create click path -- */
+
+/**
+ * A React stand-in: enough to mount ONE function component and click it.
+ *
+ * React is not installed here (the page supplies it through the module table), so
+ * this suite brings the smallest thing that behaves like it for a single mounted
+ * component — hook slots in call order, dependency-aware effects, a re-render per
+ * state change. What is under test is the SEQUENCE of service calls the control
+ * makes when a worktree is created, not React's rendering.
+ */
+function createReactStub() {
+	const state = { slots: [], index: 0, effects: [], dirty: false };
+	const sameDeps = (left, right) => Array.isArray(left) && Array.isArray(right)
+		&& left.length === right.length && left.every((value, at) => Object.is(value, right[at]));
+
+	const React = {
+		createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat() }),
+		Fragment: 'Fragment',
+		useState(initial) {
+			const at = state.index++;
+			if (!(at in state.slots)) state.slots[at] = typeof initial === 'function' ? initial() : initial;
+			return [state.slots[at], (next) => {
+				const value = typeof next === 'function' ? next(state.slots[at]) : next;
+				if (!Object.is(value, state.slots[at])) {
+					state.slots[at] = value;
+					state.dirty = true;
+				}
+			}];
+		},
+		useRef(initial) {
+			const at = state.index++;
+			if (!(at in state.slots)) state.slots[at] = { current: initial };
+			return state.slots[at];
+		},
+		useCallback(callback, deps) {
+			const at = state.index++;
+			const previous = state.slots[at];
+			// Memoised by dependency, like React: an identity that changed every render
+			// would re-run every effect that names it, and this control's effects fetch.
+			if (previous !== undefined && sameDeps(previous.deps, deps)) return previous.value;
+			state.slots[at] = { deps, value: callback };
+			return callback;
+		},
+		useEffect(effect, deps) {
+			const at = state.index++;
+			const previous = state.slots[at];
+			if (previous !== undefined && sameDeps(previous.deps, deps)) return;
+			state.effects.push({ at, deps, effect });
+		}
+	};
+
+	const render = (component, props) => {
+		state.index = 0;
+		state.effects = [];
+		const tree = component(props);
+		for (const entry of state.effects) {
+			const cleanup = entry.effect();
+			state.slots[entry.at] = { deps: entry.deps, cleanup: typeof cleanup === 'function' ? cleanup : undefined };
+		}
+		return tree;
+	};
+
+	const driver = {
+		component: null,
+		props: null,
+		tree: null,
+		/** Render, run effects, and settle every promise they started. */
+		async flush() {
+			for (let round = 0; round < 40; round += 1) {
+				await new Promise((resolve) => { setTimeout(resolve, 0); });
+				if (state.dirty) {
+					state.dirty = false;
+					driver.tree = render(driver.component, driver.props);
+					continue;
+				}
+				if (round >= 2) return driver.tree;
+			}
+			return driver.tree;
+		},
+		async mount(component, props) {
+			driver.component = component;
+			driver.props = props;
+			driver.tree = render(component, props);
+			return driver.flush();
+		},
+		async click(node) {
+			node.props.onClick();
+			return driver.flush();
+		}
+	};
+	return { React, driver };
+}
+
+/** Every element in a rendered tree that matches, without descending into components. */
+function findAll(node, matches, out = []) {
+	if (node === null || node === undefined || typeof node === 'string' || typeof node === 'number') return out;
+	if (Array.isArray(node)) {
+		for (const child of node) findAll(child, matches, out);
+		return out;
+	}
+	if (typeof node.type === 'function') return out;
+	if (matches(node)) out.push(node);
+	for (const child of node.children ?? []) findAll(child, matches, out);
+	return out;
+}
+
+/** The rendered text of a tree, so a test can read what the user is told. */
+function textOf(node) {
+	if (node === null || node === undefined || typeof node === 'boolean') return '';
+	if (typeof node === 'string' || typeof node === 'number') return String(node);
+	if (Array.isArray(node)) return node.map(textOf).join('');
+	if (typeof node.type === 'function') return '';
+	return (node.children ?? []).map(textOf).join('');
+}
+
+const WORKTREE_PATH = 'C:\\repo\\.dsh-worktrees\\repo_abc123';
+const REPO_PATH = 'C:\\repo';
+
+/** A fetch that answers this plugin's own routes, and records the calls. */
+function stubFetch(routes, calls) {
+	return async (url, options) => {
+		const path = String(url).replace('api/dsh-local-worktree/', '');
+		calls.push({ path, body: options?.body === undefined ? null : JSON.parse(options.body) });
+		const value = routes[path];
+		if (value === undefined) throw new Error(`unexpected call: ${path}`);
+		return { ok: true, json: async () => value };
+	};
+}
+
+/** Mount the control with the services and route answers a Web page would give it. */
+async function mountControl({ services = {} } = {}) {
+	const calls = [];
+	// Filled in by the test once its route answers exist; the bundle's `fetch` reads
+	// through this, because it lives in its own VM context.
+	const fetcher = { current: null };
+	const definition = loadDefinition({
+		document: { addEventListener: () => {}, removeEventListener: () => {} },
+		fetch: (url, options) => {
+			if (fetcher.current === null) throw new Error(`unexpected fetch: ${url}`);
+			return fetcher.current(url, options);
+		}
+	});
+	const { React, driver } = createReactStub();
+	const plugin = definition.factory((name) => {
+		if (name === 'react') return React;
+		throw new Error(`unexpected require: ${name}`);
+	});
+	let component = null;
+	const resolved = {
+		uiWorkspace: null,
+		workspaces: null,
+		...services
+	};
+	plugin.apply({
+		uiWorkspace: resolved.uiWorkspace,
+		workspaces: resolved.workspaces,
+		get: (name) => resolved[name] ?? undefined,
+		slots: {
+			inject: (_key, callback) => callback(),
+			register: (_meta, value) => { component = value; return () => {}; }
+		}
+	});
+	const props = { sessionId: 'session-me', useSessions: (select) => select({ byId: {}, ids: [] }) };
+	await driver.mount(component, props);
+	return { driver, calls, component, props, useFetch: (impl) => { fetcher.current = impl; } };
+}
+
+/** The create click, start to finish: picker → repository → the answer. */
+async function createThroughPicker(harness, routes) {
+	const { driver, calls } = harness;
+	harness.useFetch(stubFetch({
+		workspaces: { ok: true, version: 1, items: [{ path: REPO_PATH, title: 'repo', git: true, repoRoot: REPO_PATH }] },
+		...routes
+	}, calls));
+
+	// The composer control with no working directory: its primary click opens the
+	// repository picker rather than acting on a directory it does not have.
+	const primary = findAll(driver.tree, (node) => typeof node.props.className === 'string'
+		&& node.props.className.startsWith('dshwt-btn'));
+	await driver.click(primary[0]);
+	const repos = findAll(driver.tree, (node) => typeof node.props.className === 'string'
+		&& node.props.className.includes('dshwt-item'));
+	await driver.click(repos[0]);
+	return driver.tree;
+}
+
+test('creating a worktree registers it as a Workspace, then opens its new session', async () => {
+	const opened = [];
+	const created = [];
+	const harness = await mountControl({
+		services: {
+			// openSession is the OLD path: it throws for a session the client has never
+			// seen, which is exactly why the success path must not use it.
+			uiWorkspace: {
+				openSession: () => { throw new Error('sessions.retain: unknown session'); },
+				openWorkspace: async (workspaceId) => { opened.push(workspaceId); }
+			},
+			workspaces: {
+				create: async (input) => {
+					created.push(input.path);
+					return { workspaceId: 'ws-1', path: input.path, title: 'repo_abc123', sessionIds: [] };
+				},
+				list: { getSnapshot: () => ({ items: [] }) }
+			}
+		}
+	});
+
+	const tree = await createThroughPicker(harness, {
+		create: {
+			ok: true,
+			created: { path: WORKTREE_PATH, branch: 'dsh/wt/repo_abc123', base: 'main', reused: false },
+			workspace: { path: WORKTREE_PATH, layout: 'inside', registered: true, workspaceId: 'ws-1' },
+			session: null,
+			seat: 'client',
+			text: 'created'
+		}
+	});
+	const calls = harness.calls;
+
+	// The directory becomes a Workspace first — that is what puts it in the sidebar —
+	// and only then is its session opened, through the sidebar's own call.
+	assert.deepEqual(created, [WORKTREE_PATH]);
+	assert.deepEqual(opened, ['ws-1']);
+	assert.deepEqual(calls.map((entry) => entry.path), ['workspaces', 'create']);
+	// The host is not asked to start the session: it would be unknown to this client
+	// until a later list refresh, and the jump would silently do nothing.
+	assert.equal(calls[1].body.session, undefined, 'the browser keeps the session to itself');
+	assert.match(textOf(tree), /已进入该 worktree 的新会话/);
+});
+
+test('a client with no workspaces service degrades to the host-side session', async () => {
+	const openedSessions = [];
+	const harness = await mountControl({
+		services: {
+			// No `workspaces` at all, so the client cannot register or create anything.
+			uiWorkspace: { openSession: (id) => { openedSessions.push(id); } }
+		}
+	});
+
+	const tree = await createThroughPicker(harness, {
+		create: {
+			ok: true,
+			created: { path: WORKTREE_PATH, branch: 'dsh/wt/repo_abc123', base: 'main', reused: false },
+			workspace: { path: WORKTREE_PATH, layout: 'inside', registered: true, workspaceId: 'ws-1' },
+			session: null,
+			seat: 'client',
+			text: 'created'
+		},
+		session: { ok: true, session: { ok: true, sessionId: 'session-host-1', cwd: WORKTREE_PATH } }
+	});
+
+	// The host is asked to start it, and the client jumps if it can.
+	assert.deepEqual(harness.calls.map((entry) => entry.path), ['workspaces', 'create', 'session']);
+	assert.deepEqual(openedSessions, ['session-host-1']);
+	assert.match(textOf(tree), /已切换到该 worktree 的新会话/);
 });
