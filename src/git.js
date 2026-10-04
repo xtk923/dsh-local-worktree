@@ -363,11 +363,15 @@ export function slug(value, { max = 48 } = {}) {
  */
 export function repoKey(gitCommonDir) {
 	const normalised = String(gitCommonDir ?? '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+	// A name, not a guard: nothing is authenticated by this digest (see above).
+	// secure-review-disable-next-line SEC-201
 	return createHash('sha1').update(normalised).digest('hex').slice(0, 10);
 }
 
 /** Stable short identity for one worktree, derived from its branch name. */
 export function worktreeId(name) {
+	// Same name-making use of SHA-1 as `repoKey` above.
+	// secure-review-disable-next-line SEC-201
 	return createHash('sha1').update(String(name ?? '')).digest('hex').slice(0, 8);
 }
 
