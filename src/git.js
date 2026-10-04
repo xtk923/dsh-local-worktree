@@ -120,6 +120,29 @@ export const BRANCH_PREFIX = 'dsh/wt/';
  */
 export const WORKTREE_SUFFIX = '_worktrees';
 
+/**
+ * Container INSIDE the repository, used by the `inside` layout.
+ *
+ * The dot keeps it out of the way visually, and it MUST be listed in the
+ * repository's own `.git/info/exclude`: the container sits inside the main
+ * working tree, so without that line `git status` reports it and a `git add -A`
+ * in the main tree would commit a whole parallel checkout.
+ */
+export const INSIDE_CONTAINER = '.dsh-worktrees';
+
+/** Accepted `worktreeLayout` values. */
+export const WORKTREE_LAYOUTS = Object.freeze(['sibling', 'inside']);
+
+/** Anything that is not an explicit `inside` reads as `sibling`. */
+export function normalizeWorktreeLayout(value) {
+	return value === 'inside' ? 'inside' : 'sibling';
+}
+
+/** The line this plugin adds to a repository's `.git/info/exclude`. */
+export function containerExcludePattern() {
+	return `${INSIDE_CONTAINER}/`;
+}
+
 /** Where the created worktree's branch name is remembered across restarts. */
 export const META_FILE = '.dsh-worktree.json';
 
@@ -400,10 +423,28 @@ export function freshId({ now = Date.now(), random = Math.random } = {}) {
 	return `${stamp}-${noise}`;
 }
 
-/** `C:\a\b\repo` -> `C:\a\b\repo--dsh-worktrees` */
-export function worktreeContainer(localRoot) {
+/**
+ * Where this repository's worktrees live.
+ *
+ * `sibling` (the default) keeps them BESIDE the repository:
+ *
+ *   `C:\a\b\repo` -> `C:\a\b\repo_worktrees`
+ *
+ * `inside` puts them under the repository itself:
+ *
+ *   `C:\a\b\repo` -> `C:\a\b\repo\.dsh-worktrees`
+ *
+ * The choice is not cosmetic. DSH's sidebar groups Sessions by registered
+ * Workspace directory and nests a Workspace under its nearest REGISTERED
+ * ancestor path, so only an `inside` worktree can appear inside the
+ * repository's own sidebar group (the "Workspace Tree" grouping mode); a
+ * sibling container is always a parallel group however it is registered.
+ */
+export function worktreeContainer(localRoot, { layout } = {}) {
 	const root = resolve(String(localRoot));
-	return join(dirname(root), `${basename(root)}${WORKTREE_SUFFIX}`);
+	return normalizeWorktreeLayout(layout) === 'inside'
+		? join(root, INSIDE_CONTAINER)
+		: join(dirname(root), `${basename(root)}${WORKTREE_SUFFIX}`);
 }
 
 /**
@@ -419,9 +460,9 @@ export function worktreeContainer(localRoot) {
  * signature exists to prevent, so a caller that forgets it gets an error rather
  * than a worktree that collides with an earlier one.
  */
-export function worktreePath(localRoot, id) {
+export function worktreePath(localRoot, id, { layout } = {}) {
 	if (typeof id !== 'string' || id === '') throw new Error('worktreePath requires a fresh id');
-	return join(worktreeContainer(localRoot), `${slug(basename(resolve(String(localRoot))))}_${slug(id, { max: 24 })}`);
+	return join(worktreeContainer(localRoot, { layout }), `${slug(basename(resolve(String(localRoot))))}_${slug(id, { max: 24 })}`);
 }
 
 /**
@@ -436,13 +477,26 @@ export function branchName(localRoot, id) {
 	return `${BRANCH_PREFIX}${slug(basename(resolve(String(localRoot))))}_${slug(id, { max: 24 })}`;
 }
 
-/** The container must be adjacent to the repo, never inside it. */
-export function assertOutside(localRoot, target) {
+/**
+ * The container must hold the target, and nothing else in the repository may.
+ *
+ * For `sibling` that is "the target is outside the repository entirely". For
+ * `inside` it is the narrower and stricter "the target is under the container
+ * specifically": a worktree scattered into the repository's own tracked
+ * directories is exactly what must not happen, because it would be committed by
+ * the next `git add -A` in the main tree.
+ */
+export function assertOutside(localRoot, target, { layout } = {}) {
 	const root = resolve(String(localRoot));
-	const container = worktreeContainer(root);
+	const shape = normalizeWorktreeLayout(layout);
+	const container = worktreeContainer(root, { layout: shape });
 	if (!isAbsolute(target)) throw new Error('worktree path must be absolute');
-	if (target === root || target.startsWith(root + sep())) {
+	const inRepo = target === root || target.startsWith(root + sep());
+	if (inRepo && shape !== 'inside') {
 		throw new Error(`refusing to create a worktree inside the repository itself: ${target}`);
+	}
+	if (inRepo && !(target === container || target.startsWith(container + sep()))) {
+		throw new Error(`refusing to create a worktree outside the container ${container}: ${target}`);
 	}
 	return { container, target };
 }
@@ -490,12 +544,13 @@ export function classifyRepo({ root, status, gitCommonDir } = {}) {
  * branches. See {@link freshId} for why nothing here may be derived from the
  * repository alone.
  */
-export function planCreate({ localRoot, id, branch, startPoint, path } = {}) {
+export function planCreate({ localRoot, id, branch, startPoint, path, layout } = {}) {
 	if (typeof localRoot !== 'string' || localRoot === '') throw new Error('planCreate requires localRoot');
 	if (typeof id !== 'string' || id === '') throw new Error('planCreate requires a fresh id');
+	const shape = normalizeWorktreeLayout(layout);
 	const name = typeof branch === 'string' && branch !== '' ? branch : branchName(localRoot, id);
-	const target = typeof path === 'string' && path !== '' ? resolve(path) : worktreePath(localRoot, id);
-	assertOutside(localRoot, target);
+	const target = typeof path === 'string' && path !== '' ? resolve(path) : worktreePath(localRoot, id, { layout: shape });
+	assertOutside(localRoot, target, { layout: shape });
 	// Measured against git's own ceiling BEFORE spawning: `worktree add` would
 	// otherwise fail with `'$GIT_DIR' too big`, which explains nothing.
 	const length = pathLengthCheck(target);
@@ -511,7 +566,8 @@ export function planCreate({ localRoot, id, branch, startPoint, path } = {}) {
 		branch: name,
 		startPoint: typeof startPoint === 'string' && startPoint !== '' ? startPoint : 'HEAD',
 		path: target,
-		container: worktreeContainer(localRoot),
+		container: worktreeContainer(localRoot, { layout: shape }),
+		layout: shape,
 		pathLength: length.length,
 		pathTight: length.tight === true,
 		args: ['worktree', 'add', '-b', name, '--', target, typeof startPoint === 'string' && startPoint !== '' ? startPoint : 'HEAD']

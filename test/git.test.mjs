@@ -189,6 +189,40 @@ test('assertOutside refuses a target inside the repository', () => {
 	assert.doesNotThrow(() => assertOutside('C:\\repo', 'C:\\repo_worktrees\\repo'));
 });
 
+test('the layout decides where a worktree lands, and what may be created there', () => {
+	const root = 'C:\\Workspace\\My Project';
+
+	// `sibling` stays exactly what it was: beside the repository.
+	assert.equal(worktreeContainer(root), 'C:\\Workspace\\My Project_worktrees');
+	assert.equal(worktreeContainer(root, { layout: 'sibling' }), 'C:\\Workspace\\My Project_worktrees');
+	// Anything that is not an explicit `inside` reads as the default, so a typo in
+	// configuration can never scatter worktrees somewhere unnamed.
+	assert.equal(worktreeContainer(root, { layout: 'nonsense' }), 'C:\\Workspace\\My Project_worktrees');
+
+	// `inside` nests under the repository itself, which is what lets the sidebar put a
+	// worktree in the repository's own group instead of beside it.
+	assert.equal(worktreeContainer(root, { layout: 'inside' }), 'C:\\Workspace\\My Project\\.dsh-worktrees');
+	const inside = worktreePath(root, 'abc-1234', { layout: 'inside' });
+	assert.equal(inside, 'C:\\Workspace\\My Project\\.dsh-worktrees\\My-Project_abc-1234');
+	assert.ok(within(root, inside));
+
+	// The guard is stricter inside the repository: only the container is allowed, so a
+	// stray path in the tracked tree is still refused.
+	assert.doesNotThrow(() => assertOutside(root, inside, { layout: 'inside' }));
+	assert.throws(() => assertOutside(root, 'C:\\Workspace\\My Project\\src\\wt', { layout: 'inside' }), /outside the container/);
+	assert.throws(() => assertOutside(root, 'C:\\Workspace\\My Project\\src\\wt'), /inside the repository/);
+	// Both layouts still refuse a relative path.
+	assert.throws(() => assertOutside(root, '.dsh-worktrees\\wt', { layout: 'inside' }), /absolute/);
+
+	// planCreate carries the layout through, so the argv and the reported container
+	// describe the same directory.
+	const plan = planCreate({ localRoot: root, id: 'abc-1234', layout: 'inside' });
+	assert.equal(plan.layout, 'inside');
+	assert.equal(plan.container, 'C:\\Workspace\\My Project\\.dsh-worktrees');
+	assert.equal(plan.path, inside);
+	assert.equal(planCreate({ localRoot: root, id: 'abc-1234' }).layout, 'sibling');
+});
+
 test('samePath and within are separator- and case-insensitive', () => {
 	assert.equal(samePath('C:\\Repo\\A', 'c:/repo/a/'), true);
 	assert.equal(samePath('C:\\Repo\\A', 'C:\\Repo\\AB'), false);

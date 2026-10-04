@@ -20,7 +20,7 @@
  * @module dsh-local-worktree/workspace
  */
 
-import { readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rmdir, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 
 import {
@@ -31,12 +31,14 @@ import {
 	classifyWorktree,
 	cleanupSteps,
 	conflictedPaths,
+	containerExcludePattern,
 	describeMerge,
 	driftText,
 	freshId,
 	gitArgs,
 	META_FILE,
 	mergeSteps,
+	normalizeWorktreeLayout,
 	parseStatusV2,
 	parseWorktreePorcelain,
 	pathLengthCheck,
@@ -95,11 +97,16 @@ export class Workspace {
 	/**
 	 * @param run - `(args: string[], options?: { cwd?: string }) => Promise<{ exitCode, stdout, stderr }>`
 	 * @param options.onWarn - sink for non-fatal problems, never a logger dependency.
+	 * @param options.layout - `sibling` (default) or `inside`; see {@link worktreeContainer}.
 	 */
-	constructor(run, { onWarn } = {}) {
+	constructor(run, { onWarn, layout } = {}) {
 		if (typeof run !== 'function') throw new TypeError('Workspace requires a git runner');
 		this.run = run;
 		this.onWarn = typeof onWarn === 'function' ? onWarn : () => {};
+		// Fixed for the life of the instance: where a worktree lands decides the
+		// repository's `.git/info/exclude` line and the path a session is rooted at,
+		// so switching it halfway would leave both half-applied.
+		this.layout = normalizeWorktreeLayout(layout);
 	}
 
 	/**
@@ -154,7 +161,8 @@ export class Workspace {
 			gitDir: inside.gitDir,
 			gitCommonDir: inside.commonDir,
 			repoKey: repoKey(inside.commonDir),
-			container: worktreeContainer(inside.root),
+			container: worktreeContainer(inside.root, { layout: this.layout }),
+			layout: this.layout,
 			repo: {
 				...classification,
 				branch: status.branch,
@@ -382,7 +390,7 @@ export class Workspace {
 		let lastRefusal = null;
 		for (let attempt = 0; attempt < 8 && plan === null; attempt += 1) {
 			const candidateId = explicit ? 'explicit' : (typeof id === 'string' && id !== '' ? id : freshId());
-			const candidatePath = explicit ? resolve(targetPath) : worktreePath(root, candidateId);
+			const candidatePath = explicit ? resolve(targetPath) : worktreePath(root, candidateId, { layout: this.layout });
 			const candidateBranch = explicit ? branch : branchName(root, candidateId);
 
 			// A path git cannot build is not worth a probe, and the refusal must name
@@ -401,9 +409,21 @@ export class Workspace {
 				if (explicit) throw lastRefusal;
 				continue;
 			}
-			plan = planCreate({ localRoot: root, id: candidateId, branch: candidateBranch, startPoint: startOid, path: candidatePath });
+			plan = planCreate({
+				localRoot: root,
+				id: candidateId,
+				branch: candidateBranch,
+				startPoint: startOid,
+				path: candidatePath,
+				layout: this.layout
+			});
 		}
 		if (plan === null) throw lastRefusal ?? new GitFailure('worktree-exists', '', { operation: 'create' });
+
+		// The container is ignored BEFORE it exists: `git worktree add` is what
+		// creates it, and a `git add -A` in the main tree racing between the two
+		// would commit an entire parallel checkout.
+		await this.#ignoreContainer(root, plan.container);
 
 		await this.#must(root, gitArgs(plan.args, { cwd: root }), 'worktree-add');
 		await this.#writeMeta(plan.path, {
@@ -605,6 +625,7 @@ export class Workspace {
 			}
 			results.push({ id: step.id, ok: true });
 		}
+		await this.#removeEmptyContainer(root, path);
 		return { ok: true, removed: true, branchDeleted: results.some((entry) => entry.id === 'branch' && entry.ok), steps: results };
 	}
 
@@ -613,6 +634,7 @@ export class Workspace {
 		const root = resolve(String(repoRoot));
 		if (!(await pathExists(path))) {
 			await this.#run(root, gitArgs(['worktree', 'prune'], { cwd: root }));
+			await this.#removeEmptyContainer(root, path);
 			return { ok: true, removed: true, branchDeleted: typeof branch === 'string' ? await this.deleteBranch(root, branch) : false };
 		}
 		const result = await this.cleanup(root, { path, branch, force: true });
@@ -633,6 +655,61 @@ export class Workspace {
 	}
 
 	/* -------------------------------------------------------------- private -- */
+
+	/**
+	 * Keep the inside-layout container out of the repository's own git status.
+	 *
+	 * `.git/info/exclude` and not `.gitignore`: the line stays local to this
+	 * clone, so the plugin never appears in a commit or in a collaborator's
+	 * diff. `rev-parse --git-path` resolves the right file from any worktree of
+	 * the repository (the index is shared), and `info/` is created when a fresh
+	 * repository has none — `git init` does not always write one.
+	 */
+	async #ignoreContainer(root, container) {
+		if (this.layout !== 'inside' || typeof container !== 'string' || container === '') return false;
+		const pattern = containerExcludePattern();
+		try {
+			const reported = String((await this.#run(root, gitArgs(['rev-parse', '--git-path', 'info/exclude'], { cwd: root }))).stdout ?? '').trim();
+			const file = reported === '' ? join(root, '.git', 'info', 'exclude') : resolve(root, reported);
+			let current = '';
+			try {
+				current = await readFile(file, 'utf8');
+			} catch {
+				// Absent is the normal case for a repository that never excluded anything.
+			}
+			if (current.split(/\r?\n/).some((line) => line.trim() === pattern)) return true;
+			await mkdir(dirname(file), { recursive: true });
+			await writeFile(file, `${current === '' || current.endsWith('\n') ? current : `${current}\n`}${pattern}\n`, 'utf8');
+			return true;
+		} catch (error) {
+			// The worktree is still correct; it is only visible to git, which the
+			// next `git add -A` in the main tree would turn into a committed
+			// parallel checkout. Worth a warning rather than a failed click.
+			this.onWarn(`dsh-local-worktree: could not exclude ${container} from ${root}: ${error?.message ?? error}`);
+			return false;
+		}
+	}
+
+	/**
+	 * Drop an inside-layout container once its last worktree is gone.
+	 *
+	 * `rmdir` succeeds only on an empty directory, which is exactly the
+	 * condition to check: a container that still holds another worktree, or a
+	 * file the user put there, survives untouched. The exclude line stays —
+	 * removing it would rewrite repository state for no benefit, and it is
+	 * inert while the directory is absent.
+	 */
+	async #removeEmptyContainer(root, removedPath) {
+		if (this.layout !== 'inside' || typeof removedPath !== 'string' || removedPath === '') return false;
+		const container = worktreeContainer(root, { layout: this.layout });
+		if (!within(container, removedPath)) return false;
+		try {
+			await rmdir(container);
+			return true;
+		} catch {
+			return false;
+		}
+	}
 
 	/**
 	 * The repository containing `start`, found by walking up.
