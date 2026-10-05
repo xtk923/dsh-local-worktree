@@ -65,6 +65,14 @@ export const REASONS = {
 	'unsupported-platform': BOTH('这个平台还没有实现', 'this platform is not implemented yet'),
 	ok: BOTH('可以创建 worktree', 'ready to create a worktree'),
 	ready: BOTH('可以合并回原分支', 'ready to merge back'),
+	// The create gate, not a failure: a session standing in a worktree delivers the
+	// one it is in. Creating another from there nests an isolation inside an
+	// isolation and leaves the worktree that session was made for undelivered, so
+	// the entry is refused with the two ways forward rather than hidden.
+	'already-in-worktree': BOTH(
+		'已经在一个 worktree 里了：先把它合并回去或丢弃它，或者回到原工作区再开新的',
+		'already inside a worktree — deliver or discard it first, or create the next one from the main working tree'
+	),
 	'repo-root-only': BOTH('只有在仓库根目录才能创建 worktree', 'a worktree can only be created from the repository root')
 };
 

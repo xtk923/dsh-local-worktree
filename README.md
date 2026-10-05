@@ -53,12 +53,27 @@ composer toolbar and the session header at once.
 | a repository on a branch | **创建 worktree** — cut a new worktree and start a session in it |
 | inside a worktree it created | **合并回 &lt;branch&gt; · N** — merge the N new commits back |
 
-Creating is **always** available in a usable repository: each worktree gets its
-own `<repo>_<id>` path and its own branch, so a second click is a second worktree
-rather than a collision. Worktrees this plugin made are listed in the `⋯` menu so
-you can jump back to their session; worktrees it did **not** make — including
-DSH's own managed checkouts under `~/.dsh/worktrees/`, and any you created by
-hand — are deliberately not reported and never disable anything here.
+Creating is available in a usable repository **until the session is inside a
+worktree**. Once it is, the `⋯` menu's **创建 worktree** entry is disabled, with
+the reason on it: what that session has to finish is the worktree it is standing
+in — deliver it or discard it — and a second worktree cut from inside the first
+nests one isolation inside another. The entry is disabled rather than hidden, so
+the menu still answers "why can't I?"; **在别的仓库里开工** stays enabled, because
+that one starts fresh work in a repository you pick. In the main working tree
+creation is unconditional: each worktree gets its own `<repo>_<id>` path and its
+own branch, so a second click is a second worktree rather than a collision.
+Worktrees this plugin made are listed in the `⋯` menu so you can jump back to
+their session; worktrees it did **not** make — including DSH's own managed
+checkouts under `~/.dsh/worktrees/`, and any you created by hand — are
+deliberately not reported and never disable anything here.
+
+The rule is decided by the Host (`create` in the `status` payload, alongside
+`action`) and only *rendered* by the button, because it is a statement about the
+repository. It is deliberately advisory: the `create` route itself stays open,
+since its other callers are not this directory's session — the Hero picker cuts a
+worktree in a repository you chose, which may itself be a worktree this plugin
+registered, and `/worktree create` and the `git_worktree` tool are surfaces a
+caller drives on purpose.
 
 The picker lists non-git workspaces too, greyed with the reason: a menu that
 silently omits the directory you just picked is worse than one that says why.
@@ -89,7 +104,8 @@ old way, tries the jump anyway, and otherwise tells you where to find it. The
 `git_worktree` tool and `/worktree create` have no browser at all, so they keep
 starting the session on the Host and still register the directory as a workspace.
 
-A `⋯` menu beside it carries the secondary actions: create, deliver, open that
+A `⋯` menu beside it carries the secondary actions: create (disabled, with the
+reason, once the session is already inside a worktree), deliver, open that
 worktree's session, open the folder in the file manager, start in *another*
 repository, and discard the worktree.
 
@@ -245,7 +261,7 @@ git's `'$GIT_DIR' too big`.
 node --test test/
 ```
 
-108 tests. The repository and operation suites run **real git** in throwaway
+111 tests. The repository and operation suites run **real git** in throwaway
 repositories under the OS temp directory — no mocked child process — and the
 implementation suite drives the actual HTTP route handlers with synthetic
 requests. The assertions are about the promises above: a fast-forward stays

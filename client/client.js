@@ -508,6 +508,43 @@ window.__ModuleLoader__.load({
 			const isDeliver = kind === 'deliver';
 			const busy = phase === 'busy';
 
+			/**
+			 * Whether THIS directory may cut another worktree, and why not.
+			 *
+			 * The host decides it (`status.create`) because the rule is about the
+			 * repository rather than about markup: once a session is standing in a
+			 * worktree, what it has to finish is THAT worktree — deliver it or discard
+			 * it — and a second one cut from inside the first nests an isolation inside
+			 * an isolation.
+			 *
+			 * The fallback is not decoration. This bundle hot-reloads into a running
+			 * page while the host half only changes on a restart, so between the two
+			 * this must reach the same verdict from what the status payload has always
+			 * carried: the worktree the session is in.
+			 */
+			const gate = status && status.create && typeof status.create === 'object'
+				? status.create
+				: {
+					enabled: Boolean(status && status.repo && status.repo.usable === true)
+						&& !(status && status.worktree && status.worktree.present === true),
+					reason: status && status.worktree && status.worktree.present === true ? 'already-in-worktree' : 'ok',
+					reasonText: ''
+				};
+			const canCreate = gate.enabled === true;
+			// The entry is never HIDDEN, only disabled: a menu that silently drops the
+			// thing the user came for reads as a bug, and there is room here to say why.
+			const createHint = canCreate
+				? null
+				: gate.reasonText
+					|| (gate.reason === 'already-in-worktree'
+						? '已经在一个 worktree 里了：先把它合并回去或丢弃它，或者回到原工作区再开新的 / already inside a worktree — deliver or discard it first, or create the next one from the main working tree'
+						: '');
+			// The sub line stays short (it is one clipped row); the tooltip carries the
+			// whole sentence.
+			const createSub = !canCreate && gate.reason === 'already-in-worktree'
+				? '已经在一个 worktree 里 / already in a worktree'
+				: (status && status.repo && status.repo.root ? shortPath(status.repo.root) : null);
+
 			const onPrimary = () => {
 				if (busy) return;
 				// Before a working directory exists, the primary click opens the picker:
@@ -529,7 +566,9 @@ window.__ModuleLoader__.load({
 				type: 'button',
 				className: `dshwt-item${opt && opt.danger ? ' dshwt-item--danger' : ''}`,
 				disabled: busy || (opt && opt.disabled === true),
-				title: sub || label,
+				// A disabled entry's tooltip is its explanation, so a caller may supply
+				// one that says more than the sub line does.
+				title: (opt && opt.title) || sub || label,
 				// The menu must not steal focus from the composer behind it.
 				onMouseDown: (event) => event.preventDefault(),
 				onClick
@@ -567,10 +606,13 @@ window.__ModuleLoader__.load({
 
 			const mainOptions = () => [
 				h('div', { key: 'head', className: 'dshwt-head' }, '当前目录 / this directory'),
+				// Disabled once this session is already in a worktree: the verb that
+				// matters there is deliver, below. The host's `create` decision carries
+				// the reason, so the same rule is not re-derived here.
 				option('create', '创建 worktree / create worktree',
-					status && status.repo && status.repo.root ? shortPath(status.repo.root) : null,
+					createSub,
 					() => { setMenu(false); void run('create', { sessionId }, afterCreate); },
-					{ disabled: !status || !status.repo || status.repo.usable !== true }),
+					{ disabled: !canCreate, title: createHint }),
 				option('deliver', '合并回原分支 / deliver to the base branch',
 					status && status.repo ? status.repo.branch : null,
 					() => { setMenu(false); void run('deliver', {}, (answer) => answer.text || '已合并 / merged'); },

@@ -213,6 +213,10 @@ test('GET status outside a repository says so, with a reason the UI can print', 
 	assert.equal(answer.body.repo.reason, 'not-a-repository');
 	assert.equal(answer.body.action.kind, 'none');
 	assert.equal(answer.body.action.enabled, false);
+	// The menu's create entry follows the repository, not the primary verb: outside a
+	// repository there is nothing to cut a worktree from either.
+	assert.equal(answer.body.create.enabled, false);
+	assert.equal(answer.body.create.reason, 'not-a-repository');
 	assert.match(answer.body.repo.reasonText, /not a git repository|\u4e0d\u662f git/);
 });
 
@@ -434,6 +438,38 @@ test('the whole journey through the routes: create, status, deliver', async () =
 	assert.ok(listed.includes(again.body.created.path.replace(/\\/g, '/')), 'the untouched worktree was kept');
 });
 
+test('a session already inside a worktree is not offered another one', async () => {
+	const root = await makeRepo({ name: 'impl-inside-gate' });
+	const harness = await mount();
+	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root, sessionId: 'session-abc' } });
+	const wt = created.body.created.path;
+
+	// The MAIN tree still offers create. The gate is about the directory the session
+	// is standing in, not about a worktree existing somewhere in the repository — a
+	// worktree this plugin made is reported beside the button, never instead of it.
+	const outside = await call(harness, ROUTES.status, { query: { cwd: root } });
+	assert.equal(outside.body.action.kind, 'create');
+	assert.equal(outside.body.create.enabled, true);
+	assert.equal(outside.body.create.reason, 'ok');
+
+	// Standing INSIDE it, the primary verb is deliver and the create entry is refused
+	// with a reason the menu can print: what that session has to finish is the
+	// worktree it is in.
+	const inside = await call(harness, ROUTES.status, { query: { cwd: wt } });
+	assert.equal(inside.body.action.kind, 'deliver');
+	assert.equal(inside.body.create.enabled, false);
+	assert.equal(inside.body.create.reason, 'already-in-worktree');
+	assert.match(inside.body.create.reasonText, /worktree/);
+	assert.match(inside.body.create.reasonText, /\u5df2\u7ecf\u5728/, 'the Chinese half reaches the UI too');
+
+	// Advisory on purpose: the ROUTE stays open, because its other callers are not
+	// this directory's session. The Hero picker cuts a worktree in a repository the
+	// user chose — which may itself be a worktree this plugin registered — and the
+	// tool and `/worktree create` are surfaces a caller drives deliberately.
+	const again = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: wt, sessionId: null } });
+	assert.equal(again.body.ok, true, 'the picker, the tool and the command keep working');
+});
+
 test('the whole journey never creates a remote and never needs the network', async () => {
 	const root = await makeRepo({ name: 'impl-noremote' });
 	const harness = await mount();
@@ -535,6 +571,8 @@ test('a disabled plugin answers every action with the disabled reason', async ()
 	const status = await call(harness, ROUTES.status, { query: { cwd: root } });
 	assert.equal(status.body.enabled, false);
 	assert.equal(status.body.action.enabled, false);
+	assert.equal(status.body.create.enabled, false);
+	assert.equal(status.body.create.reason, 'disabled');
 	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root } });
 	assert.equal(created.body.ok, false);
 	assert.equal(created.body.reason, 'disabled');

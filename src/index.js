@@ -205,10 +205,12 @@ export async function buildStatus(api, cwd) {
 				sessionId: typeof record.sessionId === 'string' && record.sessionId !== '' ? record.sessionId : null
 			}));
 
-	// The primary action. CREATING is always available in a usable repository: the
-	// fresh id per worktree makes duplicates distinct objects rather than a
-	// collision, so there is nothing to refuse. Existing worktrees are offered
-	// beside it, not instead of it.
+	// The primary action. In a usable repository the MAIN working tree offers
+	// CREATE unconditionally: the fresh id per worktree makes duplicates distinct
+	// objects rather than a collision, so there is nothing to refuse there. Existing
+	// worktrees are offered beside it, not instead of it. A session standing inside
+	// a worktree gets DELIVER instead — and `create` below, which is the entry that
+	// goes quiet in that case.
 	const action = state.repo.present !== true
 		? { kind: 'none', enabled: false, reason: state.repo.reason }
 		: state.worktree !== null && state.worktree.present === true
@@ -223,6 +225,40 @@ export async function buildStatus(api, cwd) {
 				enabled: state.repo.usable === true && api.config.enabled,
 				reason: state.repo.usable === true ? 'ok' : state.repo.reason
 			};
+
+	// May THIS directory mint another worktree, and if not, why not.
+	//
+	// Reported separately from `action`, because the two answer different
+	// questions. `action` is the primary verb this directory offers, and inside a
+	// worktree that is already `deliver`; this is the menu's own "create" entry,
+	// which a session that is ALREADY ISOLATED must not be offered. A second
+	// worktree cut from inside the first nests one isolation in another and leaves
+	// the worktree that session exists for undelivered — the user's next move is to
+	// deliver or discard the one they are in, not to make a third.
+	//
+	// Advisory, deliberately: `createAction` itself stays open, because its other
+	// callers are not this directory's session. The Hero picker starts a worktree
+	// in a repository the user CHOSE, which may itself be a worktree this plugin
+	// registered, and `/worktree create` and the `git_worktree` tool are surfaces a
+	// caller drives on purpose. Refusing there would break the picker without
+	// protecting anything this rule is about.
+	//
+	// `state.worktree` is any linked worktree containing the session's directory,
+	// not only one of ours, which is the same breadth the deliver branch above
+	// already uses: whatever a session is standing in is what it has to finish.
+	const insideWorktree = state.worktree !== null && state.worktree.present === true;
+	const createReason = state.repo.present !== true || state.repo.usable !== true
+		? state.repo.reason
+		: !api.config.enabled
+			? 'disabled'
+			: insideWorktree
+				? 'already-in-worktree'
+				: 'ok';
+	const create = {
+		enabled: createReason === 'ok',
+		reason: createReason,
+		reasonText: bothText(createReason)
+	};
 
 	const merge = state.worktree !== null && state.worktree.present === true
 		? describeMerge({ baseAhead: state.worktree.baseAhead })
@@ -261,7 +297,11 @@ export async function buildStatus(api, cwd) {
 		worktreeContainer: state.repoRoot === null ? null : state.container,
 		base,
 		merge,
-		action
+		// The primary verb, and the separate answer to "may this directory cut
+		// another worktree". The menu renders both; only the second one goes quiet
+		// once the session is already inside a worktree.
+		action,
+		create
 	};
 }
 

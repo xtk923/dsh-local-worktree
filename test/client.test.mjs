@@ -333,13 +333,18 @@ function stubFetch(routes, calls) {
 }
 
 /** Mount the control with the services and route answers a Web page would give it. */
-async function mountControl({ services = {} } = {}) {
+async function mountControl({ services = {}, cwd = undefined, routes = null } = {}) {
 	const calls = [];
 	// Filled in by the test once its route answers exist; the bundle's `fetch` reads
 	// through this, because it lives in its own VM context.
 	const fetcher = { current: null };
 	const definition = loadDefinition({
 		document: { addEventListener: () => {}, removeEventListener: () => {} },
+		// The control aborts a superseded status read with a real AbortController.
+		// This sandbox is a bare V8 context, so the page's own global is handed in —
+		// it only became reachable here once a test mounted a session that HAS a
+		// working directory and therefore actually reads git state.
+		AbortController,
 		fetch: (url, options) => {
 			if (fetcher.current === null) throw new Error(`unexpected fetch: ${url}`);
 			return fetcher.current(url, options);
@@ -365,7 +370,15 @@ async function mountControl({ services = {} } = {}) {
 			register: (_meta, value) => { component = value; return () => {}; }
 		}
 	});
-	const props = { sessionId: 'session-me', useSessions: (select) => select({ byId: {}, ids: [] }) };
+	// A session that already has a working directory must have its FIRST status read
+	// answered, because the state it renders is what decides the menu. Those routes
+	// therefore go in before mounting; the picker tests install theirs afterwards,
+	// which is correct for a control that starts with no cwd at all.
+	if (routes !== null) fetcher.current = stubFetch(routes, calls);
+	const props = {
+		sessionId: 'session-me',
+		useSessions: (select) => select(cwd === undefined ? { byId: {}, ids: [] } : { byId: { 'session-me': { cwd } }, ids: [] })
+	};
 	await driver.mount(component, props);
 	return { driver, calls, component, props, useFetch: (impl) => { fetcher.current = impl; } };
 }
@@ -458,4 +471,100 @@ test('a client with no workspaces service degrades to the host-side session', as
 	assert.deepEqual(harness.calls.map((entry) => entry.path), ['workspaces', 'create', 'session']);
 	assert.deepEqual(openedSessions, ['session-host-1']);
 	assert.match(textOf(tree), /已切换到该 worktree 的新会话/);
+});
+
+/* ------------------------------------------- already inside a worktree -- */
+
+/** The status route that answers the control's own read, as it calls it. */
+const statusRoute = (cwd) => `status?cwd=${encodeURIComponent(cwd)}`;
+
+/** A status payload for a session that is standing INSIDE a worktree. */
+function insideWorktreeStatus(create) {
+	return {
+		ok: true,
+		version: 1,
+		cwd: WORKTREE_PATH,
+		enabled: true,
+		repo: {
+			present: true, usable: true, reason: 'ok', reasonText: 'ok',
+			root: REPO_PATH, localRoot: WORKTREE_PATH, branch: 'main',
+			head: 'aaa', dirty: false, modified: 0, untracked: 0
+		},
+		worktree: {
+			present: true, path: WORKTREE_PATH, branch: 'dsh/wt/repo_abc123', base: 'main',
+			ahead: 0, baseAhead: 0, dirty: false, deliverable: false,
+			state: 'no-changes', reason: 'no-new-commits', sessionId: 'session-me'
+		},
+		worktreeSession: 'session-me',
+		myWorktrees: [],
+		worktreeContainer: 'C:\\repo\\.dsh-worktrees',
+		base: null,
+		merge: null,
+		action: { kind: 'deliver', enabled: false, reason: 'no-new-commits' },
+		create
+	};
+}
+
+/** Open the `⋯` menu of a mounted control and return its entries. */
+async function openMenu(harness) {
+	const more = findAll(harness.driver.tree, (node) => node.props.className === 'dshwt-more');
+	assert.equal(more.length, 1, 'the control has one more-actions button');
+	await harness.driver.click(more[0]);
+	return findAll(harness.driver.tree, (node) => typeof node.props.className === 'string'
+		&& node.props.className.includes('dshwt-item'));
+}
+
+test('inside a worktree the create entry is disabled, and says why', async () => {
+	const harness = await mountControl({
+		cwd: WORKTREE_PATH,
+		routes: {
+			[statusRoute(WORKTREE_PATH)]: insideWorktreeStatus({
+				enabled: false,
+				reason: 'already-in-worktree',
+				reasonText: '已经在一个 worktree 里了：先把它合并回去或丢弃它 / already inside a worktree — deliver or discard it first'
+			})
+		}
+	});
+
+	const entries = await openMenu(harness);
+	const create = entries[0];
+	assert.match(textOf(create), /创建 worktree/);
+	// The whole point: a session that is already isolated is not offered a second
+	// isolation, and the worktree it is standing in is what it has to finish.
+	assert.equal(create.props.disabled, true, 'creating another worktree is not offered from inside one');
+	// Disabled, never hidden: the entry stays put and explains itself, because a menu
+	// that silently drops the thing the user came for reads as a bug.
+	assert.match(textOf(create), /已经在.*worktree/);
+	assert.match(create.props.title, /deliver or discard|合并回去|丢弃/);
+});
+
+test('the create entry survives a host half that does not report the decision yet', async () => {
+	// The client bundle hot-reloads into a running page while the host half only
+	// changes on a restart, so the entry has to reach the same verdict from what the
+	// status payload has always carried.
+	const inside = await mountControl({
+		cwd: WORKTREE_PATH,
+		routes: { [statusRoute(WORKTREE_PATH)]: insideWorktreeStatus(undefined) }
+	});
+	const insideEntries = await openMenu(inside);
+	assert.match(textOf(insideEntries[0]), /创建 worktree/);
+	assert.equal(insideEntries[0].props.disabled, true, 'the worktree the session is in is enough to refuse a second one');
+
+	// And in the main working tree — no worktree around this session — creation stays
+	// exactly as available as it was.
+	const outside = await mountControl({
+		cwd: REPO_PATH,
+		routes: {
+			[statusRoute(REPO_PATH)]: {
+				...insideWorktreeStatus(undefined),
+				cwd: REPO_PATH,
+				repo: { ...insideWorktreeStatus(undefined).repo, localRoot: REPO_PATH },
+				worktree: null,
+				worktreeSession: null,
+				action: { kind: 'create', enabled: true, reason: 'ok' }
+			}
+		}
+	});
+	const outsideEntries = await openMenu(outside);
+	assert.equal(outsideEntries[0].props.disabled, false, 'the main tree still cuts worktrees');
 });
