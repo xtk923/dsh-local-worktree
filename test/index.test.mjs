@@ -528,6 +528,46 @@ test('POST deliver reports a conflict with the paths and a recovery hint', async
 	assert.deepEqual(await git(root, ['status', '--porcelain']).then((r) => r.stdout.trim()), '', 'the main tree stayed clean');
 });
 
+test('POST deliver keeps the worktree when the caller asks it to, and still delivers', async () => {
+	const root = await makeRepo({ name: 'impl-keep' });
+	const harness = await mount();
+	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root } });
+	const wt = created.body.created.path;
+	const branch = created.body.created.branch;
+	await writeFile(join(wt, 'f.txt'), 'x\n');
+	await git(wt, ['add', '-A']);
+	await commit(wt, 'kept work');
+
+	// The user answered "keep" on the merge question: the merge itself is identical.
+	const delivered = await call(harness, ROUTES.deliver, { method: 'POST', body: { cwd: wt, cleanup: false } });
+	assert.equal(delivered.body.ok, true);
+	assert.equal(delivered.body.strategy, 'fast-forward');
+	assert.equal(delivered.body.cleanup, null, 'nothing was removed');
+	assert.equal((await git(root, ['log', '--format=%s', '-1'])).stdout.trim(), 'kept work',
+		'the commit lands in the main tree either way');
+
+	// Kept means kept: the directory, its branch and its worktree registration all
+	// survive, so the session standing there can carry on.
+	assert.equal(existsSync(wt), true);
+	const stillThere = await git(root, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
+	assert.notEqual(stillThere.stdout.trim(), '', 'the worktree branch is still there');
+	const listed = (await git(root, ['worktree', 'list'])).stdout.replace(/\\/g, '/');
+	assert.ok(listed.includes(wt.replace(/\\/g, '/')), 'git still knows the worktree');
+
+	// And so does the plugin: a worktree the user chose to keep is still the thing
+	// its session is working in, so it keeps its record — base branch included —
+	// instead of being forgotten as if it had been deleted.
+	const status = await call(harness, ROUTES.status, { query: { cwd: root } });
+	assert.deepEqual(status.body.myWorktrees.map((record) => record.path), [wt]);
+	assert.equal(status.body.myWorktrees[0].branch, branch);
+
+	// Keeping is not a way to deliver twice: the work is already in the base branch,
+	// so a second delivery is refused rather than merged again.
+	const again = await call(harness, ROUTES.deliver, { method: 'POST', body: { cwd: wt, cleanup: false } });
+	assert.equal(again.body.ok, false);
+	assert.equal(again.body.reason, 'already-merged');
+});
+
 test('POST create is refused for a repository with no commit, with a reason', async () => {
 	const dir = await looseDir('impl-empty-');
 	await git(dir, ['init', '-b', 'main', '--quiet']);
@@ -603,6 +643,10 @@ test('the agent tool is registered and drives the same two verbs', async () => {
 	const deliveredBody = JSON.parse(delivered.content[0].text);
 	assert.equal(deliveredBody.ok, true);
 	assert.equal(deliveredBody.strategy, 'fast-forward');
+	// The agent gets the same default the button offers, and the same report: the
+	// worktree is gone, and `cleanup.removed` says so.
+	assert.equal(deliveredBody.cleanup.removed, true);
+	assert.equal(existsSync(createdBody.created.path), false);
 
 	// The main tree received it: the tool and the button share one implementation.
 	const log = await git(root, ['log', '--format=%s', '-1']);
@@ -638,8 +682,32 @@ test('/worktree reports state, creates and delivers', async () => {
 	await commit(wt, 'via command');
 	const delivered = await command.handler({ rawInput: 'deliver', cwd: wt });
 	assert.equal(delivered.kind, 'success');
+	// No argument: the command's default is the SAME as the button's — merge, then
+	// remove — and its answer says what happened to the worktree.
+	assert.match(delivered.text, /已删除|was removed/);
+	assert.equal(existsSync(wt), false, 'the default removes the worktree');
 	const log = await git(root, ['log', '--format=%s', '-1']);
 	assert.equal(log.stdout.trim(), 'via command');
+});
+
+test('/worktree deliver keep merges and leaves the worktree in place', async () => {
+	const root = await makeRepo({ name: 'impl-command-keep' });
+	const harness = await mount();
+	const command = harness.commands[0];
+
+	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root } });
+	const wt = created.body.created.path;
+	await writeFile(join(wt, 'f.txt'), 'x\n');
+	await git(wt, ['add', '-A']);
+	await commit(wt, 'via keep');
+
+	// A typed command cannot show a question, so the choice is an argument — and the
+	// merge itself is unchanged.
+	const delivered = await command.handler({ rawInput: 'deliver keep', cwd: wt });
+	assert.equal(delivered.kind, 'success');
+	assert.match(delivered.text, /已保留|was kept/);
+	assert.equal(existsSync(wt), true, 'the worktree the user asked to keep is still there');
+	assert.equal((await git(root, ['log', '--format=%s', '-1'])).stdout.trim(), 'via keep');
 });
 
 test('/worktree refuses an unknown subcommand with its usage', async () => {
@@ -648,6 +716,9 @@ test('/worktree refuses an unknown subcommand with its usage', async () => {
 	const answer = await harness.commands[0].handler({ rawInput: 'frobnicate', cwd: root });
 	assert.equal(answer.kind, 'error');
 	assert.match(answer.text, /usage/i);
+	// The usage line is where the merge question is answered for a typed caller, so
+	// it has to name the option that keeps the worktree.
+	assert.match(answer.text, /deliver \[keep\]/);
 });
 
 /* ----------------------------------------------------------- degradation -- */

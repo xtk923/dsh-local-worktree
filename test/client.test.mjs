@@ -568,3 +568,109 @@ test('the create entry survives a host half that does not report the decision ye
 	const outsideEntries = await openMenu(outside);
 	assert.equal(outsideEntries[0].props.disabled, false, 'the main tree still cuts worktrees');
 });
+
+/* ---------------------------------------------- the merge click's question -- */
+
+/** The worktree with two commits waiting, so deliver is enabled. */
+const READY_STATUS = {
+	...insideWorktreeStatus(undefined),
+	worktree: {
+		...insideWorktreeStatus(undefined).worktree,
+		ahead: 2, deliverable: true, state: 'ready', reason: 'ready', dirty: false
+	},
+	merge: { strategy: 'fast-forward', text: '可快进 / fast-forwardable' },
+	action: { kind: 'deliver', enabled: true, reason: 'ready' }
+};
+
+/** Every `dshwt-item` on screen, in the order the menu renders them. */
+const itemsOf = (tree) => findAll(tree, (node) => typeof node.props.className === 'string'
+	&& node.props.className.includes('dshwt-item'));
+
+/** The heading that asks the merge question. */
+const questionOf = (tree) => findAll(tree, (node) => node.props.className === 'dshwt-head')
+	.map(textOf).join('\n');
+
+/** The primary button — the merge path when the session stands in a worktree. */
+const primaryOf = (tree) => findAll(tree, (node) => typeof node.props.className === 'string'
+	&& node.props.className.startsWith('dshwt-btn'))[0];
+
+/**
+ * The question a merge begins with.
+ *
+ * The worktree is where the user's session lives, so removing it is the user's
+ * decision — but the plugin still recommends removal, and that is what "default"
+ * has to mean in code: FIRST entry, marked, and focused, so Enter takes it.
+ */
+test('the merge click asks first, and removing the worktree is the default answer', async () => {
+	const harness = await mountControl({
+		cwd: WORKTREE_PATH,
+		routes: {
+			[statusRoute(WORKTREE_PATH)]: READY_STATUS,
+			deliver: { ok: true, strategy: 'fast-forward', text: '已把 2 个提交快进到 main', cleanup: { removed: true } }
+		}
+	});
+
+	// It used to merge the instant it was clicked; now it asks. Nothing has been
+	// merged when the question appears, so cancelling costs nothing.
+	await harness.driver.click(primaryOf(harness.driver.tree));
+	assert.deepEqual(harness.calls.map((entry) => entry.path), [statusRoute(WORKTREE_PATH)],
+		'the click opens the question; no merge was started');
+
+	assert.match(questionOf(harness.driver.tree), /怎么处理|what about the worktree/, 'the menu states the question');
+	const items = itemsOf(harness.driver.tree);
+	// The DEFAULT: first, marked, and focused, so Enter on the open question removes.
+	assert.match(textOf(items[0]), /合并并删除|merge, then remove/);
+	assert.match(textOf(items[0]), /默认|default/);
+	assert.equal(items[0].props.autoFocus, true, 'the default answer is the one Enter takes');
+	// The way out of the default sits right beside it, and cancelling is below both.
+	assert.match(textOf(items[1]), /保留|keep/);
+	assert.match(textOf(items[2]), /取消|cancel/);
+
+	await harness.driver.click(items[0]);
+	const deliver = harness.calls.find((entry) => entry.path === 'deliver');
+	assert.deepEqual(deliver.body, { cleanup: true, cwd: WORKTREE_PATH },
+		'the default answer tells the host to remove the worktree');
+	assert.match(textOf(harness.driver.tree), /已删除|was removed/, 'the user is told what happened to the worktree');
+});
+
+test('the same question offers to keep the worktree, and that choice is sent', async () => {
+	const harness = await mountControl({
+		cwd: WORKTREE_PATH,
+		routes: {
+			[statusRoute(WORKTREE_PATH)]: READY_STATUS,
+			// `cleanup: null` is what the host answers when removal was not asked for.
+			deliver: { ok: true, strategy: 'fast-forward', text: '已把 2 个提交快进到 main', cleanup: null }
+		}
+	});
+
+	await harness.driver.click(primaryOf(harness.driver.tree));
+	await harness.driver.click(itemsOf(harness.driver.tree)[1]);
+
+	const deliver = harness.calls.find((entry) => entry.path === 'deliver');
+	assert.deepEqual(deliver.body, { cleanup: false, cwd: WORKTREE_PATH },
+		'keeping is stated to the host rather than left to a configuration flag');
+	assert.match(textOf(harness.driver.tree), /已保留|was kept/);
+});
+
+test('the menu entry for deliver asks the same question as the button', async () => {
+	const harness = await mountControl({
+		cwd: WORKTREE_PATH,
+		routes: {
+			[statusRoute(WORKTREE_PATH)]: READY_STATUS,
+			deliver: { ok: true, text: '已合并', cleanup: { removed: false, reason: 'git-error' } }
+		}
+	});
+
+	const entries = await openMenu(harness);
+	const entry = entries.find((node) => textOf(node).includes('合并回原分支'));
+	assert.equal(entry.props.disabled, false, 'there is something to merge');
+	await harness.driver.click(entry);
+	assert.equal(harness.calls.some((recorded) => recorded.path === 'deliver'), false,
+		'the entry asks instead of merging');
+	assert.match(textOf(itemsOf(harness.driver.tree)[0]), /合并并删除|merge, then remove/);
+
+	// A removal the host was ASKED for and git refused is not a choice to keep: the
+	// directory is still on disk, and saying "kept" would misreport that.
+	await harness.driver.click(itemsOf(harness.driver.tree)[0]);
+	assert.match(textOf(harness.driver.tree), /未能删除|could not be removed/);
+});

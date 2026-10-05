@@ -51,7 +51,7 @@ composer toolbar and the session header at once.
 | not a git repository | nothing at all — the control does not render |
 | a repository with no commit yet | a disabled button explaining that you must commit once first |
 | a repository on a branch | **创建 worktree** — cut a new worktree and start a session in it |
-| inside a worktree it created | **合并回 &lt;branch&gt; · N** — merge the N new commits back |
+| inside a worktree it created | **合并回 &lt;branch&gt; · N** — merge the N new commits back; pressing it asks whether to **remove the worktree** afterwards, and removal is the default answer |
 
 Creating is available in a usable repository **until the session is inside a
 worktree**. Once it is, the `⋯` menu's **创建 worktree** entry is disabled, with
@@ -107,7 +107,34 @@ starting the session on the Host and still register the directory as a workspace
 A `⋯` menu beside it carries the secondary actions: create (disabled, with the
 reason, once the session is already inside a worktree), deliver, open that
 worktree's session, open the folder in the file manager, start in *another*
-repository, and discard the worktree.
+repository, and discard the worktree. Both ways into a merge — the primary button
+and the menu's **合并回原分支** entry — open the **same question** described below,
+so the two can never disagree about what a merge does.
+
+## Merging asks about the worktree, and the default is to remove it
+
+A merge used to decide the worktree's fate on its own, through the `autoCleanup`
+flag: the directory and its `dsh/wt/*` branch disappeared the moment the commits
+landed. The worktree is where the session lives, so that is now the user's call.
+Pressing **合并回 &lt;branch&gt; · N** opens a one-step question:
+
+| Entry | What it does |
+|---|---|
+| **合并并删除 worktree（默认）** | merges, then removes the directory and its own branch (with `git branch -d`: a branch whose commits are not merged survives) |
+| **合并但保留 worktree** | merges, and leaves both the directory and the branch alone |
+| **取消** | closes the question; nothing was merged, so nothing was lost |
+
+Removal is what happens if you simply confirm: it is the **first** entry, it is
+marked *默认 / default*, and it is **focused**, so `Enter` on the open question
+takes it. `Escape` cancels. The answer is reported back — *worktree 已删除*, *已保留*
+— and a removal you asked for that git then **refused** (a dirty worktree, a
+locked repository) is reported as exactly that, never as a choice to keep.
+
+Keeping a worktree is a first-class outcome, not a leftover: the directory, its
+branch and this plugin's record of it all survive, so the menu can still jump to
+that session, and a later delivery from there still knows which branch it came
+from. Keeping is not a way to deliver the same commits twice — once they are in
+the base branch, a second delivery is refused with `already-merged`.
 
 ## What "deliver" guarantees
 
@@ -124,6 +151,10 @@ repository, and discard the worktree.
    always kept, so a conflict costs a retry — never the work.
 4. **The worktree's own branch is deleted with `git branch -d`, never `-D`.** If
    its commits are not merged, git refuses and the branch survives.
+5. **The worktree is removed only because that is what you chose.** Removal is the
+   default answer to the merge question, not a side effect of merging: say *keep*
+   and the directory, the branch and the record that lets you jump back to its
+   session all stay.
 
 ## What it will not do
 
@@ -157,7 +188,7 @@ is discovered automatically from the package's `dsh.client` section.
 |---|---|---|
 | `enabled` | `true` | Keep the surfaces but refuse every action with a reason. |
 | `autoCommit` | `true` | Commit leftover worktree work before merging (a commit subject is generated from the changed file names). |
-| `autoCleanup` | `true` | After a successful merge, remove the worktree and delete its own branch if fully merged. |
+| `autoCleanup` | `true` | The answer the **surfaces that cannot ask** use — the `git_worktree` tool and `/worktree deliver` — and the fallback for a `POST /deliver` that sends no `cleanup`. The button always asks and sends the answer explicitly; removal stays the default either way. |
 | `commitMessage` | `wip: dsh worktree checkpoint` | Subject for the automatic commit. |
 | `registerTool` | `true` | Expose the `git_worktree` tool to the agent. |
 | `worktreeLayout` | `inside` | Where a worktree lands: `inside` = `<repo>\.dsh-worktrees\<repo>_<id>` (nests under the repository in the sidebar's Workspace Tree grouping, and the container is added to `.git/info/exclude`); `sibling` = `<parent>\<repo>_worktrees\<repo>_<id>`. |
@@ -173,10 +204,14 @@ is discovered automatically from the package's `dsh.client` section.
   `session: "client" | "host" | "none"` (default `client`: the browser registers the
   workspace and starts the session; `host` starts it here, for the tool and the
   command; `none` creates the directory only), and `POST /session` starts a session
-  in an existing worktree for a caller that cannot.
+  in an existing worktree for a caller that cannot. `POST /deliver` takes
+  `cleanup: boolean` — the answer to the merge question — and defaults to
+  `autoCleanup` (remove) when it is absent.
 * **The tool** — `git_worktree` with `action: status | create | deliver | discard`.
-  The agent can isolate its own work instead of being told to.
-* **The command** — `/worktree`, `/worktree create`, `/worktree deliver`.
+  The agent can isolate its own work instead of being told to; `deliver` takes the
+  same `cleanup: false` to keep the worktree.
+* **The command** — `/worktree`, `/worktree create`, `/worktree deliver [keep]`.
+  A typed command has no popover to ask in, so keeping is an argument.
 
 ## Reloading after an update
 
@@ -258,16 +293,25 @@ git's `'$GIT_DIR' too big`.
 ## Tests
 
 ```
-node --test test/
+node --test "test/**/*.test.mjs"
 ```
 
-111 tests. The repository and operation suites run **real git** in throwaway
+(That is `npm test`. On Node 24 a **directory** argument is treated as a *file* —
+`node --test test/` and `node --test test` both die with `MODULE_NOT_FOUND` — so
+the suite is named by glob; it also keeps `test/fixture.mjs`, a helper rather than
+a suite, out of the run.)
+
+115 tests. The repository and operation suites run **real git** in throwaway
 repositories under the OS temp directory — no mocked child process — and the
 implementation suite drives the actual HTTP route handlers with synthetic
 requests. The assertions are about the promises above: a fast-forward stays
 linear, a diverged base gets a real merge commit with two parents, a conflicted
 delivery restores the main tree byte-for-byte, a refused cleanup loses nothing,
-and the inside layout leaves `git status` clean. The client suite mounts the
+`cleanup: false` keeps the directory, the branch and the plugin's own record of
+it, and the inside layout leaves `git status` clean. The client suite mounts the
 browser half against a React stand-in and asserts the two calls that join a new
-worktree — register the workspace, then open its session — in that order, plus the
-degradation path when the composition has no `workspaces` service.
+worktree — register the workspace, then open its session — in that order, the
+degradation path when the composition has no `workspaces` service, and the merge
+question: that a merge click asks *before* it merges, that the default answer is
+the one that removes the worktree (first, marked, focused), and that choosing to
+keep sends `cleanup: false`.

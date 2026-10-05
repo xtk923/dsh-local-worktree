@@ -13,6 +13,10 @@
  *            creating a merge commit when it has. A conflict is DETECTED FIRST
  *            (with `merge-tree`, which touches nothing) and reported; if one ever
  *            lands anyway, the main tree is restored with `merge --abort`.
+ *            When the merge succeeds the worktree is REMOVED by default — its
+ *            directory and its own `dsh/wt/*` branch — unless the caller says to
+ *            keep it (`cleanup: false`); the button asks that question on every
+ *            merge, with removal as the default answer.
  *
  * Three surfaces, one implementation (`Workspace` in `workspace.js`):
  *
@@ -631,8 +635,15 @@ export function createApi(ctx, rawConfig) {
 				};
 			}
 
-			await forget(key, entry.branch);
-			log(`dsh-local-worktree: delivered ${result.commits} commit(s) from ${entry.branch} into ${result.base} (${result.strategy})`);
+			// The record is a promise about a worktree that is still THERE. One the user
+			// chose to keep — or one whose removal git refused — is still a directory
+			// with a session in it, and may well be where the next commit is made, so
+			// it keeps its base branch, its session id and its entry in the menu.
+			// Forgetting it here would make "merge and keep" quietly forget the very
+			// thing the user asked to keep.
+			const removed = result.cleanup !== null && result.cleanup !== undefined && result.cleanup.removed === true;
+			if (removed) await forget(key, entry.branch);
+			log(`dsh-local-worktree: delivered ${result.commits} commit(s) from ${entry.branch} into ${result.base} (${result.strategy})${removed ? '' : ', worktree kept'}`);
 			return {
 				ok: true,
 				strategy: result.strategy,
@@ -957,7 +968,11 @@ function attachTool(ctx, api) {
 				action: { type: 'string', enum: ['status', 'create', 'deliver', 'discard'], description: 'Which operation to run.' },
 				cwd: { type: 'string', description: 'Directory to act on; defaults to the session working directory.' },
 				message: { type: 'string', description: 'Commit subject for the automatic checkpoint commit (deliver only).' },
-				cleanup: { type: 'boolean', description: 'Remove the worktree after a successful delivery (deliver only).' }
+				cleanup: {
+					type: 'boolean',
+					description:
+						'Remove the worktree after a successful delivery (deliver only). Defaults to the configured `autoCleanup`, which is to remove it; pass false to keep the directory and its branch.'
+				}
 			},
 			required: ['action'],
 			additionalProperties: false
@@ -998,7 +1013,7 @@ function attachCommand(ctx, api) {
 	const COMMAND = {
 		name: 'worktree',
 		description: 'git worktree：创建隔离工作区并一键合并回原分支 / create an isolated git worktree and merge it back',
-		usage: '用法 / usage: /worktree | /worktree create | /worktree deliver'
+		usage: '用法 / usage: /worktree | /worktree create | /worktree deliver [keep]'
 	};
 
 	const handler = async (invocation) => {
@@ -1018,12 +1033,22 @@ function attachCommand(ctx, api) {
 			if (answer.ok !== true) return { kind: 'error', text: answer.reasonText ?? reasonText(answer.reason, { lang: 'both' }) };
 			return { kind: 'success', text: answer.text + (answer.session?.sessionId ? `\n新会话 / new session: ${answer.session.sessionId}` : '') };
 		}
-		if (raw === 'deliver') {
-			const answer = await api.deliverAction({ cwd });
+		if (raw === 'deliver' || raw === 'deliver keep' || raw === 'deliver --keep') {
+			// A typed command cannot show a question, so the choice is an argument and
+			// its DEFAULT is the same one the button offers: merge, then remove the
+			// worktree. `keep` is the way out of that default.
+			const answer = await api.deliverAction({ cwd, cleanup: raw === 'deliver' });
 			if (answer.ok !== true) {
 				return { kind: 'error', text: `${answer.reasonText ?? reasonText(answer.reason, { lang: 'both' })}${answer.hint ? `\n${answer.hint}` : ''}` };
 			}
-			return { kind: 'success', text: answer.text };
+			// The same three outcomes the button reports, for the same reason: a
+			// requested removal that git refused must not read as "kept on purpose".
+			const outcome = answer.cleanup === null || answer.cleanup === undefined
+				? '\nworktree 已保留 / the worktree was kept'
+				: answer.cleanup.removed === true
+					? '\nworktree 已删除 / the worktree was removed'
+					: '\nworktree 未能删除，已保留 / the worktree could not be removed and was kept';
+			return { kind: 'success', text: `${answer.text}${outcome}` };
 		}
 		return { kind: 'error', text: COMMAND.usage };
 	};

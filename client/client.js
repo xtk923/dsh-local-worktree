@@ -26,7 +26,9 @@
  *                                  registers it as a Workspace, starts a session
  *                                  inside it, THEN SHOWS that session
  *   in a repository             → "创建 worktree · <branch>"
- *   in one of its worktrees     → "合并回 <branch> · N"
+ *   in one of its worktrees     → "合并回 <branch> · N" — and pressing it asks
+ *                                  whether to remove the worktree afterwards,
+ *                                  a question whose DEFAULT is to remove it
  *   not a repository            → render nothing at all
  *
  * Navigation is the two calls the sidebar makes for ITSELF, in this order:
@@ -198,6 +200,9 @@ window.__ModuleLoader__.load({
 .dshwt-item:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2)}
 .dshwt-item:disabled{opacity:.5;cursor:not-allowed}
 .dshwt-item--danger{color:var(--dsw-alias-state-error-primary)}
+/* The default answer of a question the menu asks — here, removing the worktree.
+   It is FIRST, marked, and focused, so Enter on the open question takes it. */
+.dshwt-item--default{font-weight:600}
 .dshwt-head{padding:5px 8px 3px;font-size:11px;line-height:15px;color:var(--dsw-alias-label-secondary);white-space:normal}
 .dshwt-sub{display:block;font-size:10px;line-height:14px;color:var(--dsw-alias-label-secondary);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -270,6 +275,14 @@ window.__ModuleLoader__.load({
 					`目标 / into: ${status.repo.branch || '?'}`
 				];
 				if (ahead > 0 && status.merge && status.merge.text) parts.push(status.merge.text);
+				// The click no longer merges straight away: it opens the choice whose
+				// default is to remove the worktree. Saying so here is the only warning
+				// available BEFORE the popover covers the button.
+				if (status.action.enabled === true) {
+					parts.push('');
+					parts.push('点一下会先问：合并后删掉这个 worktree 吗？（默认删除）',
+						'the click asks first: remove this worktree after merging? (removal is the default)');
+				}
 				if (status.action.enabled !== true) {
 					// The refusal is the whole tooltip here, and the common one needs an
 					// instruction rather than a status: nothing was committed in the
@@ -353,7 +366,8 @@ window.__ModuleLoader__.load({
 			const [repos, setRepos] = React.useState(null);
 			const [phase, setPhase] = React.useState('idle');
 			const [notice, setNotice] = React.useState(null);
-			// false = closed, 'main' = this directory's actions, 'repos' = the picker.
+			// false = closed, 'main' = this directory's actions, 'repos' = the picker,
+			// 'deliver' = the question that precedes a merge (remove the worktree?).
 			const [menu, setMenu] = React.useState(false);
 			const mounted = React.useRef(true);
 			const generation = React.useRef(0);
@@ -415,6 +429,63 @@ window.__ModuleLoader__.load({
 				setPhase('idle');
 				await refresh();
 			}, [cwd, refresh]);
+
+			/**
+			 * What the user is told after a merge, including what happened to the
+			 * worktree — which is now THEIR choice rather than a configuration.
+			 *
+			 * Three different outcomes, deliberately not one: the host reports
+			 * `cleanup: null` when removal was not asked for (kept on purpose), and a
+			 * `cleanup` object whose `removed` is false when removal WAS asked for and
+			 * git refused it (a dirty worktree, a locked repository). Calling the
+			 * second one "kept" would tell the user their choice was honoured when the
+			 * directory is still on disk.
+			 */
+			const deliverNotice = React.useCallback((answer) => {
+				const text = answer.text || '已合并 / merged';
+				if (answer.cleanup === null || answer.cleanup === undefined) {
+					return `${text}，worktree 已保留 / the worktree was kept`;
+				}
+				if (answer.cleanup.removed === true) {
+					return `${text}，worktree 已删除 / the worktree was removed`;
+				}
+				return `${text}，worktree 未能删除，已保留 / the worktree could not be removed and was kept`;
+			}, []);
+
+			/**
+			 * Ask what happens to the worktree, THEN merge.
+			 *
+			 * The question exists because the answer is not the plugin's to make: the
+			 * worktree is where the user's session lives, and a merge used to remove it
+			 * silently (a configuration flag, `autoCleanup`, that nobody reads while
+			 * clicking). Removing is still the DEFAULT — it is the first entry, it is
+			 * the focused one, so Enter takes it — but keeping is now one click away.
+			 */
+			const deliverOptions = () => {
+				const worktree = (status && status.worktree) || {};
+				const repo = (status && status.repo) || {};
+				const ahead = worktree.ahead ? worktree.ahead : 0;
+				const base = repo.branch || '?';
+				const onMerge = (cleanup) => {
+					setMenu(false);
+					void run('deliver', { cleanup }, deliverNotice);
+				};
+				return [
+					h('div', { key: 'head', className: 'dshwt-head' },
+						`把 ${ahead} 个提交合并回 ${base}，这个 worktree 怎么处理？`,
+						h('span', { className: 'dshwt-sub' }, `${ahead} commit(s) into ${base} — what about the worktree?`)),
+					option('deliver-remove', '合并并删除 worktree（默认）/ merge, then remove it',
+						'删掉目录和它自己的分支；分支没合并时会保留 / removes the directory and its own branch; an unmerged branch survives',
+						() => onMerge(true),
+						{ default: true }),
+					option('deliver-keep', '合并但保留 worktree / merge, then keep it',
+						'目录和分支都留着，之后还能继续用 / keeps the directory and the branch for later work',
+						() => onMerge(false),
+						{}),
+					h('div', { key: 'sep', className: 'dshwt-sep' }),
+					option('deliver-cancel', '取消 / cancel', null, () => setMenu(false), {})
+				];
+			};
 
 			/**
 			 * The worktree exists — get the user into it, and report what happened.
@@ -552,10 +623,11 @@ window.__ModuleLoader__.load({
 				// the primary click opens the menu, whose first entry reaches it.
 				if (!hasCwd || !enabled) { setMenu(menu === false ? (hasCwd ? 'main' : 'repos') : false); return; }
 				if (isDeliver) {
-					void run('deliver', {}, (answer) => {
-						const clean = answer.cleanup && answer.cleanup.removed ? '，worktree 已清理 / cleaned up' : '';
-						return `${answer.text || '已合并 / merged'}${clean}`;
-					});
+					// The merge is preceded by its own question — see `deliverOptions`. The
+					// primary click must not bypass it, or the button and the menu would
+					// answer the same question differently. Pressing it again closes the
+					// question, the way every other primary click toggles.
+					setMenu(menu === 'deliver' ? false : 'deliver');
 					return;
 				}
 				void run('create', { sessionId }, afterCreate);
@@ -564,11 +636,14 @@ window.__ModuleLoader__.load({
 			const option = (key, label, sub, onClick, opt) => h('button', {
 				key,
 				type: 'button',
-				className: `dshwt-item${opt && opt.danger ? ' dshwt-item--danger' : ''}`,
+				className: `dshwt-item${opt && opt.danger ? ' dshwt-item--danger' : ''}${opt && opt.default ? ' dshwt-item--default' : ''}`,
 				disabled: busy || (opt && opt.disabled === true),
 				// A disabled entry's tooltip is its explanation, so a caller may supply
 				// one that says more than the sub line does.
 				title: (opt && opt.title) || sub || label,
+				// React focuses this on mount; it is how the DEFAULT answer of a question
+				// is the one Enter takes, without a dialog this plugin cannot theme.
+				autoFocus: (opt && opt.default) === true,
 				// The menu must not steal focus from the composer behind it.
 				onMouseDown: (event) => event.preventDefault(),
 				onClick
@@ -615,8 +690,11 @@ window.__ModuleLoader__.load({
 					{ disabled: !canCreate, title: createHint }),
 				option('deliver', '合并回原分支 / deliver to the base branch',
 					status && status.repo ? status.repo.branch : null,
-					() => { setMenu(false); void run('deliver', {}, (answer) => answer.text || '已合并 / merged'); },
-					{ disabled: !isDeliver || !enabled }),
+					() => setMenu('deliver'),
+					{
+						disabled: !isDeliver || !enabled,
+						title: '先选合并后是否删除这个 worktree（默认删除）/ asks whether to remove this worktree after merging — removal is the default'
+					}),
 				option('open', '在文件管理器中打开 / open in file manager',
 					status ? shortPath(status.worktree && status.worktree.path ? status.worktree.path : status.repoRoot) : null,
 					() => { setMenu(false); void run('open', {}, () => '已打开 / opened'); },
@@ -683,7 +761,7 @@ window.__ModuleLoader__.load({
 						onClick: () => setMenu(menu === false ? (hasCwd ? 'main' : 'repos') : false)
 					}, '⋯'),
 					menu === false ? null : h('div', { className: 'dshwt-menu', role: 'menu' },
-						menu === 'repos' ? repoOptions() : mainOptions()
+						menu === 'repos' ? repoOptions() : menu === 'deliver' ? deliverOptions() : mainOptions()
 					)
 				),
 				// One line, clipped to the row it lives in. The full story — paths, the
