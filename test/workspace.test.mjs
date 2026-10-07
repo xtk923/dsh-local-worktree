@@ -250,6 +250,61 @@ test('deliver commits uncommitted worktree work first, so nothing is lost', asyn
 	assert.match(tracked.stdout, /build\/out\.bin/, 'an ignored artifact must not be dropped at merge time');
 });
 
+/* ----------------------------------------------------------------- commit -- */
+
+test('commit writes the uncommitted work with a subject taken from the file names', async () => {
+	const { root } = await repo({ name: 'commit-basic' });
+	const created = await ws.create(root);
+	await writeFile(join(created.path, 'app.txt'), 'edited\n');
+	await writeFile(join(created.path, 'new.txt'), 'added\n');
+
+	const result = await ws.commit(created.path);
+	assert.equal(result.ok, true);
+	assert.equal(result.changes, 2, 'both the edit and the new file are part of the commit');
+	assert.match(result.message, /app\.txt|new\.txt/, 'the subject names what changed');
+	assert.equal((await ws.status(created.path)).dirty, false, 'the tree is clean afterwards');
+	// The commit lands on the worktree's own branch, so it is still deliverable as one.
+	assert.equal(result.head, await oid(created.path));
+	assert.equal((await git(root, ['rev-list', '--count', `${await oid(root)}..${result.head}`])).stdout.trim(), '1');
+});
+
+test('commit honours an explicit subject over the generated one', async () => {
+	const { root } = await repo({ name: 'commit-message' });
+	const created = await ws.create(root);
+	await writeFile(join(created.path, 'app.txt'), 'edited\n');
+
+	const result = await ws.commit(created.path, { message: 'feat: say it properly' });
+	assert.equal(result.ok, true);
+	assert.equal(result.message, 'feat: say it properly');
+	assert.equal((await subjects(created.path))[0], 'feat: say it properly');
+});
+
+test('commit refuses a clean tree instead of making an empty commit', async () => {
+	const { root } = await repo({ name: 'commit-clean' });
+	const created = await ws.create(root);
+	const before = await oid(created.path);
+
+	const result = await ws.commit(created.path);
+	assert.equal(result.ok, false);
+	assert.equal(result.reason, 'nothing-to-commit');
+	assert.equal(result.changes, 0);
+	assert.equal(await oid(created.path), before, 'nothing was written');
+});
+
+test('commit keeps ignored artifacts, exactly as the automatic checkpoint does', async () => {
+	const { root } = await repo({ name: 'commit-ignored' });
+	const created = await ws.create(root);
+	const { mkdir } = await import('node:fs/promises');
+	await mkdir(join(created.path, 'build'), { recursive: true });
+	await writeFile(join(created.path, '.gitignore'), 'build/\n');
+	await writeFile(join(created.path, 'build/out.bin'), 'artifact\n');
+
+	const result = await ws.commit(created.path);
+	assert.equal(result.ok, true);
+	const tracked = await git(created.path, ['ls-files']);
+	assert.match(tracked.stdout, /build\/out\.bin/, 'the artifact is committed with --force, as delivery does');
+});
+
 test('deliver refuses a dirty main tree and touches nothing', async () => {
 	const { root } = await repo({ name: 'main-dirty' });
 	const created = await ws.create(root);

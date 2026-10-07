@@ -479,7 +479,7 @@ test('a client with no workspaces service degrades to the host-side session', as
 const statusRoute = (cwd) => `status?cwd=${encodeURIComponent(cwd)}`;
 
 /** A status payload for a session that is standing INSIDE a worktree. */
-function insideWorktreeStatus(create) {
+function insideWorktreeStatus(create, { commitChanges = 0 } = {}) {
 	return {
 		ok: true,
 		version: 1,
@@ -488,11 +488,12 @@ function insideWorktreeStatus(create) {
 		repo: {
 			present: true, usable: true, reason: 'ok', reasonText: 'ok',
 			root: REPO_PATH, localRoot: WORKTREE_PATH, branch: 'main',
-			head: 'aaa', dirty: false, modified: 0, untracked: 0
+			head: 'aaa', dirty: commitChanges > 0, modified: commitChanges, untracked: 0
 		},
 		worktree: {
 			present: true, path: WORKTREE_PATH, branch: 'dsh/wt/repo_abc123', base: 'main',
-			ahead: 0, baseAhead: 0, dirty: false, deliverable: false,
+			ahead: 0, baseAhead: 0, dirty: commitChanges > 0, modified: commitChanges, untracked: 0,
+			deliverable: false,
 			state: 'no-changes', reason: 'no-new-commits', sessionId: 'session-me'
 		},
 		worktreeSession: 'session-me',
@@ -500,6 +501,18 @@ function insideWorktreeStatus(create) {
 		worktreeContainer: 'C:\\repo\\.dsh-worktrees',
 		base: null,
 		merge: null,
+		// The Host's own commit decision; `commitChanges` is how a test says "there is
+		// something to commit here" without restating where it would land.
+		commit: {
+			enabled: commitChanges > 0,
+			reason: commitChanges > 0 ? 'ok' : 'nothing-to-commit',
+			reasonText: commitChanges > 0 ? 'ready' : 'nothing to commit',
+			path: WORKTREE_PATH,
+			changes: commitChanges,
+			staged: 0,
+			unstaged: commitChanges,
+			untracked: 0
+		},
 		action: { kind: 'deliver', enabled: false, reason: 'no-new-commits' },
 		create
 	};
@@ -592,7 +605,12 @@ const questionOf = (tree) => findAll(tree, (node) => node.props.className === 'd
 
 /** The primary button — the merge path when the session stands in a worktree. */
 const primaryOf = (tree) => findAll(tree, (node) => typeof node.props.className === 'string'
-	&& node.props.className.startsWith('dshwt-btn'))[0];
+	&& node.props.className.startsWith('dshwt-btn')
+	&& !node.props.className.includes('dshwt-btn--commit'))[0];
+
+/** The commit button, which stands beside the primary one in the same row. */
+const commitOf = (tree) => findAll(tree, (node) => typeof node.props.className === 'string'
+	&& node.props.className.includes('dshwt-btn--commit'))[0];
 
 /**
  * The question a merge begins with.
@@ -616,7 +634,7 @@ test('the merge click asks first, and removing the worktree is the default answe
 	assert.deepEqual(harness.calls.map((entry) => entry.path), [statusRoute(WORKTREE_PATH)],
 		'the click opens the question; no merge was started');
 
-	assert.match(questionOf(harness.driver.tree), /怎么处理|what about the worktree/, 'the menu states the question');
+	assert.match(questionOf(harness.driver.tree), /worktree 怎么处理|what about the worktree/, 'the menu states the question');
 	const items = itemsOf(harness.driver.tree);
 	// The DEFAULT: first, marked, and focused, so Enter on the open question removes.
 	assert.match(textOf(items[0]), /合并并删除|merge, then remove/);
@@ -662,7 +680,7 @@ test('the menu entry for deliver asks the same question as the button', async ()
 	});
 
 	const entries = await openMenu(harness);
-	const entry = entries.find((node) => textOf(node).includes('合并回原分支'));
+	const entry = entries.find((node) => textOf(node).includes('合并到原分支'));
 	assert.equal(entry.props.disabled, false, 'there is something to merge');
 	await harness.driver.click(entry);
 	assert.equal(harness.calls.some((recorded) => recorded.path === 'deliver'), false,
@@ -673,4 +691,79 @@ test('the menu entry for deliver asks the same question as the button', async ()
 	// directory is still on disk, and saying "kept" would misreport that.
 	await harness.driver.click(itemsOf(harness.driver.tree)[0]);
 	assert.match(textOf(harness.driver.tree), /未能删除|could not be removed/);
+});
+
+/* ------------------------------------------------------- the commit button -- */
+
+test('commit is its own button beside merge, and pressing it commits', async () => {
+	const harness = await mountControl({
+		cwd: WORKTREE_PATH,
+		routes: {
+			[statusRoute(WORKTREE_PATH)]: insideWorktreeStatus(undefined, { commitChanges: 3 }),
+			commit: { ok: true, changes: 3, message: 'wip: dsh worktree checkpoint: a.js, b.js', head: 'bbb', text: '已提交' }
+		}
+	});
+
+	// Both verbs are on the row at once: the user's two decisions do not share a
+	// button, so committing never has to go through a merge and vice versa.
+	const commit = commitOf(harness.driver.tree);
+	assert.ok(commit !== undefined, 'the commit button is rendered');
+	assert.equal(commit.props.disabled, false, 'there are three changes to commit');
+	assert.match(textOf(commit), /提交 · 3/, 'the label carries how much there is to commit');
+	assert.ok(primaryOf(harness.driver.tree) !== commit, 'the merge button is a separate element');
+
+	await harness.driver.click(commit);
+	const sent = harness.calls.find((entry) => entry.path === 'commit');
+	assert.deepEqual(sent.body, { cwd: WORKTREE_PATH }, 'the commit names the directory it acts on');
+	assert.equal(harness.calls.some((entry) => entry.path === 'deliver'), false, 'committing does not merge');
+	assert.match(textOf(harness.driver.tree), /已提交 3 处改动/, 'the user is told what was committed');
+});
+
+test('with nothing to commit the button is disabled and its tooltip is the reason', async () => {
+	const harness = await mountControl({
+		cwd: WORKTREE_PATH,
+		routes: { [statusRoute(WORKTREE_PATH)]: insideWorktreeStatus(undefined, { commitChanges: 0 }) }
+	});
+
+	const commit = commitOf(harness.driver.tree);
+	assert.equal(commit.props.disabled, true, 'an empty tree is not a commit');
+	assert.match(commit.props.title, /没有需要提交的改动|nothing to commit/);
+	// Disabled, never hidden: the row keeps its shape, so the merge button beside it
+	// does not move under the cursor when the tree becomes clean.
+	assert.match(textOf(commit), /提交/);
+});
+
+test('the commit decision falls back to the drift the status payload already carries', async () => {
+	// A client bundle hot-reloads into a running page while the host half only
+	// changes on a restart, so between the two the button must still reach a verdict
+	// from the worktree counts the payload has always reported.
+	const legacy = insideWorktreeStatus(undefined);
+	delete legacy.commit;
+	const harness = await mountControl({
+		cwd: WORKTREE_PATH,
+		routes: { [statusRoute(WORKTREE_PATH)]: legacy }
+	});
+
+	assert.equal(commitOf(harness.driver.tree).props.disabled, true, 'no changes means nothing to commit');
+
+	const dirty = insideWorktreeStatus(undefined);
+	delete dirty.commit;
+	dirty.worktree = { ...dirty.worktree, dirty: true, modified: 2 };
+	const busy = await mountControl({
+		cwd: WORKTREE_PATH,
+		routes: { [statusRoute(WORKTREE_PATH)]: dirty }
+	});
+	assert.equal(commitOf(busy.driver.tree).props.disabled, false, 'the worktree counts are enough to offer a commit');
+});
+
+test('the menu offers the same two verbs as the row', async () => {
+	const harness = await mountControl({
+		cwd: WORKTREE_PATH,
+		routes: { [statusRoute(WORKTREE_PATH)]: insideWorktreeStatus(undefined, { commitChanges: 1 }) }
+	});
+
+	const entries = await openMenu(harness);
+	const labels = entries.map(textOf);
+	assert.ok(labels.some((label) => label.includes('提交 / commit')), 'the menu can commit too');
+	assert.ok(labels.some((label) => label.includes('合并到原分支')), 'and merge');
 });

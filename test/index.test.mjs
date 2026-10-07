@@ -218,6 +218,51 @@ test('GET status outside a repository says so, with a reason the UI can print', 
 	assert.equal(answer.body.create.enabled, false);
 	assert.equal(answer.body.create.reason, 'not-a-repository');
 	assert.match(answer.body.repo.reasonText, /not a git repository|\u4e0d\u662f git/);
+	// Neither is there anything to commit: the button is not offered at all.
+	assert.equal(answer.body.commit.enabled, false);
+	assert.equal(answer.body.commit.reason, 'not-a-repository');
+});
+
+test('POST commit commits the worktree the session stands in, and status reports it ready', async () => {
+	const root = await makeRepo({ name: 'impl-commit' });
+	const harness = await mount();
+
+	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root, session: 'none' } });
+	const worktreePath = created.body.created.path;
+
+	// Nothing is uncommitted yet, so the button is dark and says why.
+	const idle = await call(harness, ROUTES.status, { query: { cwd: worktreePath } });
+	assert.equal(idle.body.commit.enabled, false);
+	assert.equal(idle.body.commit.reason, 'nothing-to-commit');
+	assert.equal(idle.body.commit.changes, 0);
+	// The commit is about the worktree the session stands in, not the main tree.
+	assert.equal(idle.body.commit.path, worktreePath);
+
+	// An agent leaves work behind, uncommitted, exactly as it does between turns.
+	await writeFile(join(worktreePath, 'feature.txt'), 'committed from the button\n');
+	const dirty = await call(harness, ROUTES.status, { query: { cwd: worktreePath } });
+	assert.equal(dirty.body.commit.enabled, true);
+	assert.equal(dirty.body.commit.changes, 1);
+
+	const committed = await call(harness, ROUTES.commit, { method: 'POST', body: { cwd: worktreePath } });
+	assert.equal(committed.body.ok, true);
+	assert.equal(committed.body.changes, 1);
+	assert.match(committed.body.message, /feature\.txt/, 'the generated subject names the changed file');
+	assert.match(committed.body.text, /committed|已提交/);
+
+	// The commit is on the worktree's branch, so it is deliverable, and the main
+	// tree has not been touched by committing.
+	const after = await call(harness, ROUTES.status, { query: { cwd: worktreePath } });
+	assert.equal(after.body.commit.enabled, false, 'the tree is clean again');
+	assert.equal(after.body.worktree.ahead, 1);
+	assert.equal(after.body.action.enabled, true);
+	assert.equal((await call(harness, ROUTES.status, { query: { cwd: root } })).body.worktree, null);
+
+	// And a second press is a refusal rather than an empty commit.
+	const again = await call(harness, ROUTES.commit, { method: 'POST', body: { cwd: worktreePath } });
+	assert.equal(again.body.ok, false);
+	assert.equal(again.body.reason, 'nothing-to-commit');
+	assert.match(again.body.reasonText, /nothing to commit|没有需要提交/);
 });
 
 test('GET status in a fresh repository offers CREATE and names the worktree container', async () => {
@@ -658,6 +703,33 @@ test('the tool is not registered when the configuration turns it off', async () 
 	assert.equal(harness.tools.length, 0);
 });
 
+test('the tool can commit, so an agent does not have to reach for a shell', async () => {
+	const root = await makeRepo({ name: 'impl-tool-commit' });
+	const harness = await mount();
+	const tool = harness.tools[0];
+
+	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root, session: 'none' } });
+	const worktreePath = created.body.created.path;
+	await writeFile(join(worktreePath, 'agent.txt'), 'left behind uncommitted\n');
+
+	const generated = JSON.parse((await tool.handler({ action: 'commit', cwd: worktreePath }, {})).content[0].text);
+	assert.equal(generated.ok, true);
+	assert.equal(generated.changes, 1);
+	assert.match(generated.message, /agent\.txt/);
+
+	// The same verb with a subject the agent chose, and the same refusal when there
+	// is nothing left to commit.
+	await writeFile(join(worktreePath, 'agent.txt'), 'a second edit\n');
+	const said = JSON.parse((await tool.handler({ action: 'commit', cwd: worktreePath, message: 'fix: second edit' }, {})).content[0].text);
+	assert.equal(said.ok, true);
+	assert.equal(said.message, 'fix: second edit');
+	assert.equal((await git(worktreePath, ['log', '--format=%s', '-1'])).stdout.trim(), 'fix: second edit');
+
+	const empty = JSON.parse((await tool.handler({ action: 'commit', cwd: worktreePath }, {})).content[0].text);
+	assert.equal(empty.ok, false);
+	assert.equal(empty.reason, 'nothing-to-commit');
+});
+
 test('/worktree reports state, creates and delivers', async () => {
 	const root = await makeRepo({ name: 'impl-command' });
 	const harness = await mount();
@@ -708,6 +780,33 @@ test('/worktree deliver keep merges and leaves the worktree in place', async () 
 	assert.match(delivered.text, /已保留|was kept/);
 	assert.equal(existsSync(wt), true, 'the worktree the user asked to keep is still there');
 	assert.equal((await git(root, ['log', '--format=%s', '-1'])).stdout.trim(), 'via keep');
+});
+
+test('/worktree commit takes the rest of the line as its subject', async () => {
+	const root = await makeRepo({ name: 'impl-command-commit' });
+	const harness = await mount();
+	const command = harness.commands[0];
+
+	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root, session: 'none' } });
+	const wt = created.body.created.path;
+
+	// A typed commit with a subject of its own, kept as typed rather than folded to
+	// lower case with the verb.
+	await writeFile(join(wt, 'f.txt'), 'x\n');
+	const said = await command.handler({ rawInput: 'commit Fix The Thing', cwd: wt });
+	assert.equal(said.kind, 'success');
+	assert.equal((await git(wt, ['log', '--format=%s', '-1'])).stdout.trim(), 'Fix The Thing');
+
+	// Bare `commit` generates the subject from the file names, and refuses when the
+	// tree is clean instead of writing an empty commit.
+	await writeFile(join(wt, 'g.txt'), 'y\n');
+	const generated = await command.handler({ rawInput: 'commit', cwd: wt });
+	assert.equal(generated.kind, 'success');
+	assert.match((await git(wt, ['log', '--format=%s', '-1'])).stdout, /g\.txt/);
+
+	const empty = await command.handler({ rawInput: 'commit', cwd: wt });
+	assert.equal(empty.kind, 'error');
+	assert.match(empty.text, /nothing to commit|没有需要提交/);
 });
 
 test('/worktree refuses an unknown subcommand with its usage', async () => {

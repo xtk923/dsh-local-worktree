@@ -1,13 +1,18 @@
 /**
  * dsh-local-worktree — isolate the work with git, then deliver it back locally.
  *
- * The plugin's whole job, in two verbs:
+ * The plugin's whole job, in three verbs:
  *
  *   CREATE   cut a linked worktree beside the repository, on its own `dsh/wt/*`
  *            branch, and record which branch it came from. Nothing is copied and
  *            nothing is fetched: a linked worktree shares the repository's object
  *            database, so the commits made in it are already reachable from the
  *            main tree — no remote, no bundle, no GitHub.
+ *   COMMIT   commit whatever is uncommitted in the directory the session is in —
+ *            the worktree when it stands in one, the repository root otherwise.
+ *            The subject is generated from the changed file names unless the
+ *            caller supplies one. This is the button that makes "commit" a
+ *            decision the user takes, rather than a side effect of merging.
  *   DELIVER  merge that branch back into the branch it was cut from, in the MAIN
  *            working tree, fast-forwarding when the base has not moved and
  *            creating a merge commit when it has. A conflict is DETECTED FIRST
@@ -21,7 +26,7 @@
  * Three surfaces, one implementation (`Workspace` in `workspace.js`):
  *
  *   HTTP   `/api/dsh-local-worktree/*` for the button in the Web UI;
- *   TOOL   `git_worktree` so the agent can drive the same two verbs;
+ *   TOOL   `git_worktree` so the agent can drive the same three verbs;
  *   CMD    `/worktree` for a user who does not want to move the mouse.
  *
  * Every route and every tool call answers with the SAME error shape
@@ -47,7 +52,7 @@ import {
 	dropWorktree,
 	saveRegistry
 } from './registry.js';
-import { bothText, deliveredText, reasonText } from './text.js';
+import { bothText, committedText, deliveredText, reasonText } from './text.js';
 import { GitFailure, Workspace } from './workspace.js';
 
 export const name = 'dsh-local-worktree';
@@ -66,6 +71,7 @@ export const API_PREFIX = '/api/dsh-local-worktree';
 export const ROUTES = Object.freeze({
 	status: `${API_PREFIX}/status`,
 	create: `${API_PREFIX}/create`,
+	commit: `${API_PREFIX}/commit`,
 	deliver: `${API_PREFIX}/deliver`,
 	discard: `${API_PREFIX}/discard`,
 	open: `${API_PREFIX}/open`,
@@ -268,6 +274,43 @@ export async function buildStatus(api, cwd) {
 		? describeMerge({ baseAhead: state.worktree.baseAhead })
 		: null;
 
+	// The COMMIT decision, beside the merge one.
+	//
+	// `inside` — the directory a commit lands in — is the worktree when the session
+	// stands in one and the repository root otherwise. That mirrors where the
+	// automatic checkpoint of a delivery writes, so the button and the merge can
+	// never disagree about which directory they are about.
+	//
+	// It is reported for BOTH places rather than only inside a worktree because a
+	// session working directly on a branch is the same problem with fewer steps:
+	// changes that need committing before anything can be merged anywhere.
+	const commitDirectory = insideWorktree ? state.worktree.path : state.repoRoot;
+	const commitStatus = state.repo.present !== true
+		? null
+		: await api.workspace.status(commitDirectory);
+	const commitChanges = commitStatus === null
+		? 0
+		: Number(commitStatus.staged ?? 0) + Number(commitStatus.unstaged ?? 0) + Number(commitStatus.untracked ?? 0);
+	const commitReason = state.repo.present !== true || state.repo.usable !== true
+		? state.repo.reason
+		: !api.config.enabled
+			? 'disabled'
+			: (commitStatus?.conflicted ?? 0) > 0
+				? 'worktree-conflicted'
+				: commitChanges === 0
+					? 'nothing-to-commit'
+					: 'ok';
+	const commit = {
+		enabled: commitReason === 'ok',
+		reason: commitReason,
+		reasonText: bothText(commitReason),
+		path: commitDirectory,
+		changes: commitChanges,
+		staged: Number(commitStatus?.staged ?? 0),
+		unstaged: Number(commitStatus?.unstaged ?? 0),
+		untracked: Number(commitStatus?.untracked ?? 0)
+	};
+
 	return {
 		ok: true,
 		version: 1,
@@ -301,6 +344,9 @@ export async function buildStatus(api, cwd) {
 		worktreeContainer: state.repoRoot === null ? null : state.container,
 		base,
 		merge,
+		// The commit verb, decided by the Host for the same reason `create` is: it
+		// is a statement about git state, not about markup.
+		commit,
 		// The primary verb, and the separate answer to "may this directory cut
 		// another worktree". The menu renders both; only the second one goes quiet
 		// once the session is already inside a worktree.
@@ -346,7 +392,7 @@ export function createApi(ctx, rawConfig) {
 		workspace,
 		registryPath,
 		lastError: null,
-		calls: { status: 0, create: 0, deliver: 0, discard: 0, session: 0, workspaces: 0 }
+		calls: { status: 0, create: 0, commit: 0, deliver: 0, discard: 0, session: 0, workspaces: 0 }
 	};
 
 	/** Load the registry once, lazily, and remember the failure rather than retrying. */
@@ -659,6 +705,55 @@ export function createApi(ctx, rawConfig) {
 		});
 	};
 
+	/**
+	 * Commit what is uncommitted in this directory — the button's own verb.
+	 *
+	 * Deliberately NOT routed through `deliver`: the whole point of a button is
+	 * that committing and merging are two decisions. A delivery that checkpoints
+	 * the worktree (because `autoCommit` is on) is still the fallback for callers
+	 * that cannot press anything, and this action changes nothing about it.
+	 *
+	 * There is no `withLock` here. The lock serializes create and deliver against
+	 * each other, where two interleaved operations could leave a branch half
+	 * merged; a commit is a single atomic git command over one index, and making
+	 * the button wait behind a merge the user did not ask for would be worse.
+	 */
+	const commitAction = async ({ cwd, message } = {}) => {
+		if (!config.enabled) return { ok: false, reason: 'disabled' };
+		const directory = safeDirectory(cwd);
+		if (directory === null) return { ok: false, reason: 'invalid-path' };
+
+		const state0 = await workspace.inspect(directory);
+		if (state0.repo.present !== true) return { ok: false, reason: state0.repo.reason };
+
+		// The same directory the status payload named, recomputed from this read
+		// rather than taken from the caller: the caller's `cwd` may be a
+		// subdirectory, and only the inspection knows where the worktree begins.
+		const target = state0.worktree !== null && state0.worktree.present === true ? state0.worktree.path : state0.repoRoot;
+		if (typeof target !== 'string' || target === '') return { ok: false, reason: 'worktree-missing' };
+
+		const result = await workspace.commit(target, { message });
+		if (result.ok !== true) {
+			return {
+				ok: false,
+				reason: result.reason,
+				reasonText: bothText(result.reason),
+				changes: result.changes ?? 0,
+				quoted: result.quoted ?? ''
+			};
+		}
+
+		log(`dsh-local-worktree: committed ${result.changes} change(s) in ${target} as ${result.head ?? '?'}`);
+		return {
+			ok: true,
+			path: target,
+			changes: result.changes,
+			message: result.message,
+			head: result.head ?? null,
+			text: committedText(result)
+		};
+	};
+
 	/** Throw the worktree away without merging (force, and only our own branch). */
 	const discardAction = async ({ cwd } = {}) => {
 		if (!config.enabled) return { ok: false, reason: 'disabled' };
@@ -743,6 +838,7 @@ export function createApi(ctx, rawConfig) {
 	};
 
 	api.createAction = createAction;
+	api.commitAction = commitAction;
 	api.deliverAction = deliverAction;
 	api.discardAction = discardAction;
 	api.openAction = openAction;
@@ -900,6 +996,12 @@ function attachRoutes(ctx, api) {
 		return api.openSessionAction({ cwd: body.cwd, sessionId: body.sessionId ?? null });
 	}, 'dsh-local-worktree: POST session');
 
+	route(ROUTES.commit, 'POST', async (req) => {
+		api.state.calls.commit += 1;
+		const body = await readBody(req);
+		return api.commitAction({ cwd: body.cwd, message: body.message });
+	}, 'dsh-local-worktree: POST commit');
+
 	route(ROUTES.deliver, 'POST', async (req) => {
 		api.state.calls.deliver += 1;
 		const body = await readBody(req);
@@ -946,8 +1048,8 @@ function attachRoutes(ctx, api) {
 /**
  * Register the agent tool.
  *
- * The same two operations the button offers, with the same reasons on failure,
- * so an agent can isolate its own work instead of being told to.
+ * The same operations the buttons offer, with the same reasons on failure, so an
+ * agent can isolate its own work instead of being told to.
  */
 function attachTool(ctx, api) {
 	const tools = ctx.get?.('tools');
@@ -959,15 +1061,16 @@ function attachTool(ctx, api) {
 			'Create and deliver a git worktree, entirely locally (no remote, no network).',
 			'"create" cuts a linked worktree under the repository on its own dsh/wt/* branch, registers its directory as a Workspace, and starts a session rooted there.',
 			'"status" reports whether the current directory is inside such a worktree and how far it has drifted.',
+			'"commit" commits everything uncommitted in this directory (the worktree when the session is inside one), with a subject generated from the changed file names unless `message` is given.',
 			'"deliver" merges the worktree\'s commits back into the branch it was cut from, in the main working tree: it fast-forwards when that branch has not moved and creates a merge commit when it has.',
 			'A conflict is detected before anything is written and reported with the paths involved; the main working tree is never left half-merged.'
 		].join(' '),
 		parameters: {
 			type: 'object',
 			properties: {
-				action: { type: 'string', enum: ['status', 'create', 'deliver', 'discard'], description: 'Which operation to run.' },
+				action: { type: 'string', enum: ['status', 'commit', 'create', 'deliver', 'discard'], description: 'Which operation to run.' },
 				cwd: { type: 'string', description: 'Directory to act on; defaults to the session working directory.' },
-				message: { type: 'string', description: 'Commit subject for the automatic checkpoint commit (deliver only).' },
+				message: { type: 'string', description: 'Commit subject, for `commit` and for the checkpoint commit a `deliver` may make.' },
 				cleanup: {
 					type: 'boolean',
 					description:
@@ -985,11 +1088,13 @@ function attachTool(ctx, api) {
 				// 'host': an agent asking for a worktree has no browser to hand the
 				// Session to, so this side starts it and reports its id.
 				? await api.createAction({ cwd, session: 'host' })
-				: action === 'deliver'
-					? await api.deliverAction({ cwd, message: args?.message, cleanup: args?.cleanup })
-					: action === 'discard'
-						? await api.discardAction({ cwd })
-						: await api.statusOf(cwd);
+				: action === 'commit'
+					? await api.commitAction({ cwd, message: args?.message })
+					: action === 'deliver'
+						? await api.deliverAction({ cwd, message: args?.message, cleanup: args?.cleanup })
+						: action === 'discard'
+							? await api.discardAction({ cwd })
+							: await api.statusOf(cwd);
 			return { content: [{ type: 'text', text: JSON.stringify(answer, null, 2) }] };
 		}
 	};
@@ -1002,9 +1107,9 @@ function attachTool(ctx, api) {
 /**
  * Register `/worktree`.
  *
- * Deliberately tiny: the command reports state and runs the two verbs, so a user
- * who prefers typing is not a second-class citizen and — more usefully — so the
- * feature can be exercised in a composition where the UI half never loaded.
+ * Deliberately tiny: the command reports state and runs the three verbs, so a
+ * user who prefers typing is not a second-class citizen and — more usefully — so
+ * the feature can be exercised in a composition where the UI half never loaded.
  */
 function attachCommand(ctx, api) {
 	const commands = ctx.get?.('commands');
@@ -1012,12 +1117,15 @@ function attachCommand(ctx, api) {
 
 	const COMMAND = {
 		name: 'worktree',
-		description: 'git worktree：创建隔离工作区并一键合并回原分支 / create an isolated git worktree and merge it back',
-		usage: '用法 / usage: /worktree | /worktree create | /worktree deliver [keep]'
+		description: 'git worktree：创建隔离工作区、提交，并一键合并回原分支 / create an isolated git worktree, commit in it, and merge it back',
+		usage: '用法 / usage: /worktree | /worktree create | /worktree commit [msg] | /worktree deliver [keep]'
 	};
 
 	const handler = async (invocation) => {
-		const raw = String(invocation?.rawInput ?? '').trim().toLowerCase();
+		// The verb is matched case-insensitively; the rest of the line is kept as
+		// typed, because for `commit <subject>` it IS the user's text.
+		const typed = String(invocation?.rawInput ?? '').trim();
+		const raw = typed.toLowerCase();
 		const cwd = invocation?.cwd ?? invocation?.agent?.cwd ?? process.cwd();
 		if (raw === '' || raw === 'status') {
 			const status = await api.statusOf(cwd);
@@ -1032,6 +1140,14 @@ function attachCommand(ctx, api) {
 			const answer = await api.createAction({ cwd, session: 'host' });
 			if (answer.ok !== true) return { kind: 'error', text: answer.reasonText ?? reasonText(answer.reason, { lang: 'both' }) };
 			return { kind: 'success', text: answer.text + (answer.session?.sessionId ? `\n新会话 / new session: ${answer.session.sessionId}` : '') };
+		}
+		if (raw === 'commit' || raw.startsWith('commit ')) {
+			// The rest of the line is the subject, so a typed commit can say something
+			// the file names cannot. Empty means the generated subject.
+			const message = typed.slice('commit'.length).trim();
+			const answer = await api.commitAction({ cwd, message: message === '' ? undefined : message });
+			if (answer.ok !== true) return { kind: 'error', text: answer.reasonText ?? reasonText(answer.reason, { lang: 'both' }) };
+			return { kind: 'success', text: answer.text };
 		}
 		if (raw === 'deliver' || raw === 'deliver keep' || raw === 'deliver --keep') {
 			// A typed command cannot show a question, so the choice is an argument and
@@ -1096,6 +1212,7 @@ export function install(ctx, rawConfig) {
 				version: 1,
 				status: (cwd) => api.statusOf(cwd),
 				create: (options) => api.createAction(options),
+				commit: (options) => api.commitAction(options),
 				openSession: (options) => api.openSessionAction(options),
 				deliver: (options) => api.deliverAction(options),
 				discard: (options) => api.discardAction(options),

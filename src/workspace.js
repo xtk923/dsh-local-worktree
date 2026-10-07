@@ -32,6 +32,7 @@ import {
 	cleanupSteps,
 	conflictedPaths,
 	containerExcludePattern,
+	DEFAULT_COMMIT_MESSAGE,
 	describeMerge,
 	driftText,
 	freshId,
@@ -600,6 +601,57 @@ export class Workspace {
 
 		if (cleanup === true) summary.cleanup = await this.cleanup(root, { path, branch: plan.worktreeBranch });
 		return summary;
+	}
+
+	/**
+	 * Commit whatever is uncommitted in one directory — the button's own verb.
+	 *
+	 * Deliberately the SAME three steps the automatic checkpoint inside `deliver`
+	 * runs (`add --all --force -- .`, then `commit -m`), so pressing the button and
+	 * letting a delivery checkpoint the work produce the identical commit. Nothing
+	 * here is invented for the button: a repository's hooks run, no pathspec is
+	 * narrowed, and the subject comes from {@link suggestCommitMessage} over the
+	 * change list the caller already read.
+	 *
+	 * The refusals come BEFORE the stage, because staging is a write: a clean tree
+	 * would otherwise be turned into an empty commit attempt, and a missing
+	 * identity into a `git add` the user never asked for.
+	 */
+	async commit(cwd, { message } = {}) {
+		const where = resolve(String(cwd));
+		const status = await this.status(where);
+		if (status.dirty !== true) {
+			return { ok: false, reason: 'nothing-to-commit', path: where, changes: 0 };
+		}
+
+		const changes = Number(status.staged ?? 0) + Number(status.unstaged ?? 0) + Number(status.untracked ?? 0);
+		const subject = typeof message === 'string' && message.trim() !== ''
+			? message.trim()
+			: suggestCommitMessage(status, { prefix: DEFAULT_COMMIT_MESSAGE });
+
+		if ((await this.hasIdentity(where)) !== true) {
+			return { ok: false, reason: 'identity-missing', path: where, changes, message: subject };
+		}
+
+		const staged = await this.#run(where, gitArgs(['add', '--all', '--force', '--', '.'], { cwd: where }));
+		if (staged.exitCode !== 0) {
+			return { ok: false, reason: classifyGitFailure(staged), detail: '', quoted: quotedFromGit(staged.stderr), path: where, changes };
+		}
+
+		// No `--no-verify`: the repository's own `pre-commit` hook (a secret scanner,
+		// a linter) exists to stop exactly this kind of commit, and skipping it would
+		// be this plugin deciding that the user's guard does not apply.
+		const committed = await this.#run(where, gitArgs(['commit', '-m', subject, '--'], { cwd: where }));
+		if (committed.exitCode !== 0) {
+			if (/nothing to commit|no changes added/i.test(`${committed.stdout}${committed.stderr}`)) {
+				// A tree dirty only through ignored files stages nothing; that is not a
+				// failure, and it is reported as the no-op it is.
+				return { ok: false, reason: 'nothing-to-commit', path: where, changes: 0 };
+			}
+			return { ok: false, reason: classifyGitFailure(committed), detail: '', quoted: quotedFromGit(committed.stderr), path: where, changes };
+		}
+
+		return { ok: true, path: where, message: subject, changes, head: await this.head(where) };
 	}
 
 	/**

@@ -185,6 +185,15 @@ window.__ModuleLoader__.load({
 .dshwt-btn--deliver{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);
   border-color:var(--dsw-alias-border-l1)}
 .dshwt-btn--deliver:hover:not(:disabled){background:var(--dsw-alias-bg-layer-1)}
+/* The commit button is a sibling of the merge button, not a fallback for it, and
+   it stops looking like one once there is something to commit: a solid border is
+   the only difference between "you could" and "you should". */
+.dshwt-btn--commit{color:var(--dsw-alias-label-secondary);border-color:var(--dsw-alias-border-l1)}
+.dshwt-btn--commit:hover:not(:disabled){color:var(--dsw-alias-label-primary)}
+/* Whichever of the two is the next thing the user has to do carries the emphasis
+   — commit while the worktree is dirty, merge once it is not. Border and label
+   only: a filled button beside a filled button reads as one control split in two. */
+.dshwt-btn--lead{color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2)}
 .dshwt-btn--start{color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2)}
 .dshwt-more{box-sizing:border-box;width:18px;height:26px;padding:0;border:none;border-radius:6px;
   cursor:pointer;color:var(--dsw-alias-label-secondary);background:transparent;font-size:12px;line-height:1}
@@ -247,11 +256,22 @@ window.__ModuleLoader__.load({
 				// The label is the ONLY explanation a disabled button gets, so each case
 				// names the state rather than the branch: "worktree · master" told the
 				// user nothing about why there was nothing to click.
-				if (ahead > 0) return `合并回 ${status.repo.branch || '?'} · ${ahead}`;
-				if (worktree.dirty) return 'worktree 有未提交改动';
-				return 'worktree 还没有新提交';
+				if (ahead > 0) return `合并 · ${ahead}`;
+				if (worktree.dirty) return '待提交';
+				return '无新提交';
 			}
 			return status.repo.branch ? `创建 worktree · ${status.repo.branch}` : '创建 worktree';
+		}
+
+		/**
+		 * The commit button's label: the verb, and how much it would commit.
+		 *
+		 * The count is the point of putting it on the button — "提交 3" answers both
+		 * "what does this do" and "is there anything to do" without a tooltip.
+		 */
+		function commitLabel(commit) {
+			if (commit === null) return '提交';
+			return `提交 · ${commit.changes}`;
 		}
 
 		/** The tooltip: what this click will do, or why it will not. */
@@ -259,9 +279,9 @@ window.__ModuleLoader__.load({
 			if (phase === 'busy') return '正在执行 git 操作… / running a git operation…';
 			if (!hasCwd) {
 				return [
-					'还没选择工作目录：点这里选一个 git 仓库，直接用 worktree 开工',
-					'No working directory yet — pick a git repository to start in a worktree',
-					'会先建 worktree，再开一个落在里面的新会话 / creates the worktree, then a session inside it'
+					'选一个 git 仓库，直接用 worktree 开工',
+					'Pick a git repository to start in a worktree',
+					'先建 worktree，再开一个落在里面的新会话 / creates the worktree, then a session inside it'
 				].join('\n');
 			}
 			if (status === null) return '正在读取 git 状态… / reading git state…';
@@ -271,42 +291,25 @@ window.__ModuleLoader__.load({
 				const ahead = worktree.ahead ? worktree.ahead : 0;
 				const parts = [
 					`worktree: ${worktree.path || ''}`,
-					`分支 / branch: ${worktree.branch ? worktree.branch : '?'}`,
-					`目标 / into: ${status.repo.branch || '?'}`
+					`分支 / branch: ${worktree.branch ? worktree.branch : '?'} → ${status.repo.branch || '?'}`
 				];
 				if (ahead > 0 && status.merge && status.merge.text) parts.push(status.merge.text);
-				// The click no longer merges straight away: it opens the choice whose
-				// default is to remove the worktree. Saying so here is the only warning
-				// available BEFORE the popover covers the button.
+				// The click asks before it merges; saying so here is the only warning
+				// available BEFORE the question covers the button.
 				if (status.action.enabled === true) {
-					parts.push('');
-					parts.push('点一下会先问：合并后删掉这个 worktree 吗？（默认删除）',
-						'the click asks first: remove this worktree after merging? (removal is the default)');
+					parts.push('', '点一下先问是否删除 worktree（默认删除）', 'asks whether to remove the worktree (default: remove)');
+				} else {
+					// Nothing to merge. The common cause now has a button of its own, so
+					// the tooltip points at it instead of printing git commands.
+					parts.push('', worktree.dirty
+						? '有未提交改动：先点「提交」 / uncommitted changes — press 提交 first'
+						: '还没有新提交 / nothing committed here yet');
 				}
-				if (status.action.enabled !== true) {
-					// The refusal is the whole tooltip here, and the common one needs an
-					// instruction rather than a status: nothing was committed in the
-					// worktree yet, so there is nothing to merge.
-					parts.push('');
-					parts.push(worktree.dirty
-						? 'worktree 里有未提交的改动：先提交，按钮才会亮 / uncommitted changes — commit them and this button turns on'
-						: '这个 worktree 还没有提交任何东西，没有可合并的内容',
-						'');
-					parts.push('在这个 worktree 里：git add -A && git commit -m "..."',
-						'然后回到这里点按钮即可合并回原分支',
-						'In the worktree: git add -A && git commit -m "..."',
-						'then press this button to merge into the base branch');
-				}
-				// The worktree being BEHIND its base is not a refusal — it is the reason a
-				// clean worktree can still have nothing to deliver, and on its own the
-				// message above would read as "you did nothing" when the work actually
-				// landed in the main repository. Say where it went.
+				// A worktree BEHIND its base is not a refusal — it is the reason a clean
+				// worktree can have nothing to merge. Say where the work went.
 				if (worktree.baseAhead > 0) {
-					parts.push('',
-						`注意：主分支已经领先这个 worktree ${worktree.baseAhead} 个提交`,
-						'如果你刚才是在主仓库里改的，那个提交就在主分支上，这个 worktree 里没有东西可交',
-						'note: the base branch is ' + worktree.baseAhead + ' commit(s) ahead of this worktree',
-						'if you worked in the main repository, the commit is already on the base branch');
+					parts.push('', `主分支领先 ${worktree.baseAhead} 个提交（改动可能已在主分支上）`,
+						`the base is ${worktree.baseAhead} commit(s) ahead — the work may already be there`);
 				}
 				return parts.join('\n');
 			}
@@ -316,16 +319,43 @@ window.__ModuleLoader__.load({
 			const lines = [
 				`仓库 / repository: ${status.repo.root || ''}`,
 				`worktree 建在 / worktrees land in: ${status.worktreeContainer || ''}`,
-				'目录名 <repo>_<时间戳+随机>，每次点击新建一个 / path is <repo>_<timestamp+random>, a new one per click',
-				'本地 git，不使用 remote / local git only, no remote'
+				'每次点击新建一个目录 / a new directory per click',
+				'本地 git，不用 remote / local git only, no remote'
 			];
 			const mine = Array.isArray(status.myWorktrees) ? status.myWorktrees : [];
 			if (mine.length > 0) {
-				lines.push('');
-				lines.push(`本插件已建 ${mine.length} 个 / this plugin already made ${mine.length}:`);
+				lines.push('', `本插件已建 ${mine.length} 个 / this plugin already made ${mine.length}:`);
 				for (const record of mine.slice(0, 4)) lines.push(`  ${record.path}`);
 			}
 			return lines.join('\n');
+		}
+
+		/**
+		 * The commit button's tooltip, including the counts it would commit.
+		 *
+		 * The counts are what make a disabled button explain itself: "0" is the
+		 * reason, so it does not need a sentence about git commands.
+		 */
+		function commitTitle(status, phase, hasCwd) {
+			if (phase === 'busy') return '正在执行 git 操作… / running a git operation…';
+			if (!hasCwd) return '先选一个 git 仓库 / pick a git repository first';
+			if (status === null) return '正在读取 git 状态… / reading git state…';
+			const commit = status.commit ?? null;
+			if (commit === null) return '这里没有 git 仓库 / not a git repository here';
+			const where = status.worktree && status.worktree.present === true ? 'worktree' : (status.repo.branch || '当前分支');
+			const counts = `${commit.staged} 已暂存 / staged, ${commit.unstaged} 未暂存 / unstaged, ${commit.untracked} 新文件 / untracked`;
+			if (commit.enabled !== true) {
+				return [
+					`没有需要提交的改动（${counts}）`,
+					`nothing to commit (${counts})`
+				].join('\n');
+			}
+			return [
+				`提交 ${commit.changes} 处改动到 ${where}`,
+				`commit ${commit.changes} change(s) in ${where}`,
+				counts,
+				'提交信息按改动文件名自动生成，hooks 照常运行 / subject generated from the file names; hooks still run'
+			].join('\n');
 		}
 
 		/** The branch glyph, so the control reads as git at a glance. */
@@ -334,6 +364,16 @@ window.__ModuleLoader__.load({
 				h('path', {
 					fill: 'currentColor',
 					d: 'M5 2.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm0 1a.5.5 0 1 1 0 1 .5.5 0 0 1 0-1Zm6 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm0 1a.5.5 0 1 1 0 1 .5.5 0 0 1 0-1ZM4.5 5.6v3.9a2.5 2.5 0 0 0 2.5 2.5h2a2.5 2.5 0 0 0 2.5-2.5V5.6a2 2 0 0 1-1-.4v4.3a1.5 1.5 0 0 1-1.5 1.5h-2A1.5 1.5 0 0 1 5.5 9.5V5.2a2 2 0 0 1-1 .4Zm5.4.9a2.5 2.5 0 0 0 2.6-2.5V3.5a.5.5 0 0 0-1 0V4a1.5 1.5 0 0 1-1.6 1.5.5.5 0 0 0 0 1Z'
+				})
+			);
+		}
+
+		/** A commit glyph: the dot a commit is drawn as, on its line. */
+		function CommitGlyph() {
+			return h('svg', { width: 13, height: 13, viewBox: '0 0 16 16', 'aria-hidden': true, style: { flex: '0 0 auto' } },
+				h('path', {
+					fill: 'currentColor',
+					d: 'M8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Zm0 1a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3ZM1.5 7.5h4a3.5 3.5 0 0 1 5 0h4a.5.5 0 0 1 0 1h-4a3.5 3.5 0 0 1-5 0h-4a.5.5 0 0 1 0-1Z'
 				})
 			);
 		}
@@ -453,13 +493,25 @@ window.__ModuleLoader__.load({
 			}, []);
 
 			/**
+			 * What the user is told after an explicit commit.
+			 *
+			 * The subject is repeated because it was generated from the changed file
+			 * names rather than typed by the user: seeing it is how they learn what
+			 * the click wrote into their history.
+			 */
+			const commitNotice = React.useCallback((answer) => {
+				const count = answer.changes ?? 0;
+				const subject = answer.message ? `：${answer.message}` : '';
+				return `已提交 ${count} 处改动${subject} / committed ${count} change(s)`;
+			}, []);
+
+			/**
 			 * Ask what happens to the worktree, THEN merge.
 			 *
 			 * The question exists because the answer is not the plugin's to make: the
-			 * worktree is where the user's session lives, and a merge used to remove it
-			 * silently (a configuration flag, `autoCleanup`, that nobody reads while
-			 * clicking). Removing is still the DEFAULT — it is the first entry, it is
-			 * the focused one, so Enter takes it — but keeping is now one click away.
+			 * worktree is where the user's session lives, so a merge does not get to
+			 * remove it without being told to. Removing is still the DEFAULT — first
+			 * entry, marked, focused, so Enter takes it — and keeping is one click away.
 			 */
 			const deliverOptions = () => {
 				const worktree = (status && status.worktree) || {};
@@ -472,14 +524,14 @@ window.__ModuleLoader__.load({
 				};
 				return [
 					h('div', { key: 'head', className: 'dshwt-head' },
-						`把 ${ahead} 个提交合并回 ${base}，这个 worktree 怎么处理？`,
-						h('span', { className: 'dshwt-sub' }, `${ahead} commit(s) into ${base} — what about the worktree?`)),
-					option('deliver-remove', '合并并删除 worktree（默认）/ merge, then remove it',
-						'删掉目录和它自己的分支；分支没合并时会保留 / removes the directory and its own branch; an unmerged branch survives',
+						`合并 ${ahead} 个提交到 ${base}，worktree 怎么处理？`,
+						h('span', { className: 'dshwt-sub' }, `merge ${ahead} commit(s) into ${base} — what about the worktree?`)),
+					option('deliver-remove', '合并并删除（默认）/ merge, then remove',
+						'删除目录和它自己的分支 / removes the directory and its own branch',
 						() => onMerge(true),
 						{ default: true }),
-					option('deliver-keep', '合并但保留 worktree / merge, then keep it',
-						'目录和分支都留着，之后还能继续用 / keeps the directory and the branch for later work',
+					option('deliver-keep', '合并但保留 / merge, then keep',
+						'目录和分支都留着 / keeps the directory and the branch',
 						() => onMerge(false),
 						{}),
 					h('div', { key: 'sep', className: 'dshwt-sep' }),
@@ -608,20 +660,63 @@ window.__ModuleLoader__.load({
 				? null
 				: gate.reasonText
 					|| (gate.reason === 'already-in-worktree'
-						? '已经在一个 worktree 里了：先把它合并回去或丢弃它，或者回到原工作区再开新的 / already inside a worktree — deliver or discard it first, or create the next one from the main working tree'
+						? '已经在 worktree 里：先合并或丢弃它 / already inside a worktree — deliver or discard it first'
 						: '');
 			// The sub line stays short (it is one clipped row); the tooltip carries the
 			// whole sentence.
 			const createSub = !canCreate && gate.reason === 'already-in-worktree'
-				? '已经在一个 worktree 里 / already in a worktree'
+				? '已经在 worktree 里 / already in a worktree'
 				: (status && status.repo && status.repo.root ? shortPath(status.repo.root) : null);
+
+			/**
+			 * The commit verb, as its own button.
+			 *
+			 * The host decides it (`status.commit`) for the same reason it decides
+			 * `create`: whether there is anything to commit is a statement about git
+			 * state. The fallback is for a client bundle that has hot-reloaded ahead of
+			 * the host half, which only changes on a restart — between the two it reads
+			 * the counts off the worktree the status payload has always carried.
+			 */
+			const commit = status && status.commit && typeof status.commit === 'object'
+				? status.commit
+				: (() => {
+					if (!status || !status.repo || status.repo.present !== true) return null;
+					const worktree = status.worktree && status.worktree.present === true ? status.worktree : null;
+					const changes = worktree
+						? Number(worktree.modified ?? 0) + Number(worktree.untracked ?? 0)
+						: Number(status.repo.modified ?? 0) + Number(status.repo.untracked ?? 0);
+					return {
+						enabled: changes > 0,
+						reason: changes > 0 ? 'ok' : 'nothing-to-commit',
+						reasonText: '',
+						changes,
+						staged: 0,
+						unstaged: Number(worktree ? worktree.modified : status.repo.modified) || 0,
+						untracked: Number(worktree ? worktree.untracked : status.repo.untracked) || 0
+					};
+				})();
+			const canCommit = commit !== null && commit.enabled === true;
+			// Never disabled by the absent working directory alone: with no session cwd
+			// there is no directory to commit in, so the button is not offered at all
+			// (the primary button is the picker in that state).
+			const showCommit = hasCwd && commit !== null;
+			// A commit is the one thing the user has to do before the merge button can
+			// light up, so it is the thing emphasised while that is true.
+			const commitLeads = canCommit && isDeliver && enabled !== true;
+
+			const onCommit = () => {
+				if (busy || !canCommit) return;
+				setMenu(false);
+				void run('commit', {}, commitNotice);
+			};
 
 			const onPrimary = () => {
 				if (busy) return;
 				// Before a working directory exists, the primary click opens the picker:
 				// there is no repository to act on yet. When a worktree already exists
 				// the primary click opens the menu, whose first entry reaches it.
-				if (!hasCwd || !enabled) { setMenu(menu === false ? (hasCwd ? 'main' : 'repos') : false); return; }
+				if (!hasCwd) { setMenu(menu === false ? 'repos' : false); return; }
+				if (!enabled) { setMenu(menu === false ? 'main' : false); return; }
 				if (isDeliver) {
 					// The merge is preceded by its own question — see `deliverOptions`. The
 					// primary click must not bypass it, or the button and the menu would
@@ -681,19 +776,25 @@ window.__ModuleLoader__.load({
 
 			const mainOptions = () => [
 				h('div', { key: 'head', className: 'dshwt-head' }, '当前目录 / this directory'),
-				// Disabled once this session is already in a worktree: the verb that
-				// matters there is deliver, below. The host's `create` decision carries
-				// the reason, so the same rule is not re-derived here.
+				// The same two verbs the toolbar buttons carry, so the menu is a
+				// complete answer rather than a different one. Disabled once this
+				// session is already in a worktree: the verb that matters there is the
+				// merge below. The host's decision carries the reason, so the rule is
+				// not re-derived here.
 				option('create', '创建 worktree / create worktree',
 					createSub,
 					() => { setMenu(false); void run('create', { sessionId }, afterCreate); },
 					{ disabled: !canCreate, title: createHint }),
-				option('deliver', '合并回原分支 / deliver to the base branch',
+				option('commit', '提交 / commit',
+					commit === null ? null : `${commit.changes} 处改动 / ${commit.changes} change(s)`,
+					onCommit,
+					{ disabled: !canCommit, title: commitTitle(status, phase, hasCwd) }),
+				option('deliver', '合并到原分支 / merge into the base branch',
 					status && status.repo ? status.repo.branch : null,
 					() => setMenu('deliver'),
 					{
 						disabled: !isDeliver || !enabled,
-						title: '先选合并后是否删除这个 worktree（默认删除）/ asks whether to remove this worktree after merging — removal is the default'
+						title: '先问是否删除 worktree（默认删除）/ asks whether to remove the worktree — removal is the default'
 					}),
 				option('open', '在文件管理器中打开 / open in file manager',
 					status ? shortPath(status.worktree && status.worktree.path ? status.worktree.path : status.repoRoot) : null,
@@ -704,8 +805,8 @@ window.__ModuleLoader__.load({
 				// checkouts, a hand-made one) are none of this control's business and
 				// must never disable anything here.
 				mineWorktrees().length > 0 ? h('div', { key: 'mine-head', className: 'dshwt-head' },
-					`本插件已建 ${mineWorktrees().length} 个 worktree，点下面可以跳过去。在这个会话里改动会直接落到 ${status && status.repo ? status.repo.branch || '当前分支' : '当前分支'}`,
-					h('span', { className: 'dshwt-sub' }, `${mineWorktrees().length} worktree(s) waiting — edits made HERE land on the base branch`)) : null,
+					`本插件已建 ${mineWorktrees().length} 个 worktree；在这里改动会落到 ${status && status.repo ? status.repo.branch || '当前分支' : '当前分支'}`,
+					h('span', { className: 'dshwt-sub' }, `${mineWorktrees().length} worktree(s) — edits made HERE land on the base branch`)) : null,
 				...mineWorktrees().map((record) => option(
 					`mine:${record.path}`,
 					'跳回已有 worktree / go to existing worktree',
@@ -714,13 +815,13 @@ window.__ModuleLoader__.load({
 						setMenu(false);
 						const target = sessionOfWorktree(record);
 						if (target === null) {
-							setNotice(`worktree: ${record.path}\n没有记录到它的会话，请到左侧会话列表打开 / no session is on record — open it from the sidebar`);
+							setNotice(`worktree: ${record.path}\n没有记录到会话，请到左侧打开 / no session on record — open it from the sidebar`);
 							return;
 						}
 						const move = openInUi(target);
 						setNotice(move === 'opened'
 							? '已切换到该 worktree 的会话 / switched to that worktree\'s session'
-							: '无法自动切换，请到左侧会话列表打开它 / could not switch automatically — open it from the sidebar');
+							: '无法自动切换，请到左侧打开 / could not switch — open it from the sidebar');
 					},
 					{}
 				)),
@@ -728,19 +829,33 @@ window.__ModuleLoader__.load({
 				option('switch', '在别的仓库里开工 / start in another repository', null,
 					() => setMenu('repos'), {}),
 				h('div', { key: 'sep2', className: 'dshwt-sep' }),
-				option('discard', '丢弃 worktree（不合并）/ discard worktree', null,
+				option('discard', '丢弃 worktree / discard worktree', null,
 					() => { setMenu(false); void run('discard', {}, () => '已丢弃 / discarded'); },
 					{ disabled: !isDeliver, danger: true }),
 				isDeliver ? h('div', { key: 'note', className: 'dshwt-note' },
-					'丢弃会强制删除 worktree 目录和它自己的分支，未提交的改动会丢失。/ Discarding force-removes the worktree directory and its own branch; uncommitted changes are lost.') : null
+					'丢弃会强删目录和它自己的分支，未提交改动会丢失。/ Discarding force-removes the directory and its own branch; uncommitted changes are lost.') : null
 			];
 
 			return h(React.Fragment, null,
 				h('style', { 'data-plugin': 'dsh-local-worktree' }, CSS),
 				h('div', { className: 'dshwt-wrap' },
+					// COMMIT and MERGE are two buttons side by side, in the order the
+					// work happens: commit the worktree, then merge it. Both read the
+					// host's own decision, so neither can offer what git would refuse.
+					showCommit ? h('button', {
+						type: 'button',
+						className: `dshwt-btn dshwt-btn--commit${commitLeads ? ' dshwt-btn--lead' : ''}`,
+						disabled: busy || !canCommit,
+						title: commitTitle(status, phase, hasCwd),
+						'aria-label': commitTitle(status, phase, hasCwd),
+						onClick: onCommit
+					},
+						h(CommitGlyph),
+						h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, commitLabel(commit))
+					) : null,
 					h('button', {
 						type: 'button',
-						className: `dshwt-btn${isDeliver ? ' dshwt-btn--deliver' : ''}${!hasCwd ? ' dshwt-btn--start' : ''}`,
+						className: `dshwt-btn${isDeliver ? ' dshwt-btn--deliver' : ''}${!hasCwd ? ' dshwt-btn--start' : ''}${commitLeads ? '' : isDeliver && enabled ? ' dshwt-btn--lead' : ''}`,
 						disabled: busy,
 						title: titleFor(status, phase, hasCwd),
 						'aria-label': titleFor(status, phase, hasCwd),
@@ -765,9 +880,9 @@ window.__ModuleLoader__.load({
 					)
 				),
 				// One line, clipped to the row it lives in. The full story — paths, the
-				// recovery command, the drift counts — belongs in the tooltip, which does
-				// not move anything; a multi-line banner in the composer toolbar pushes
-				// the input the user is typing into.
+				// reason — belongs in the tooltip, which does not move anything; a
+				// multi-line banner in the composer toolbar pushes the input the user is
+				// typing into.
 				notice ? h('div', { className: 'dshwt-note' }, notice) : null
 			);
 		}

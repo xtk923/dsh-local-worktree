@@ -51,7 +51,15 @@ composer toolbar and the session header at once.
 | not a git repository | nothing at all — the control does not render |
 | a repository with no commit yet | a disabled button explaining that you must commit once first |
 | a repository on a branch | **创建 worktree** — cut a new worktree and start a session in it |
-| inside a worktree it created | **合并回 &lt;branch&gt; · N** — merge the N new commits back; pressing it asks whether to **remove the worktree** afterwards, and removal is the default answer |
+| inside a worktree it created | **提交 · N** — commit the N changed files in the worktree (subject generated from their names); and **合并 · N** — merge the N new commits back, which asks whether to **remove the worktree** afterwards, removal being the default answer |
+
+Commit and merge are **two buttons side by side**, in the order the work happens,
+and both read a decision the Host made (`status.commit`, `status.action`) rather
+than deriving one from what the payload happens to contain. The one that is the
+user's next step carries the accent: **提交 · N** while the worktree is dirty,
+**合并 · N** once it is not. A button that cannot act is disabled rather than
+hidden, and its tooltip is the reason — "nothing to commit (0 staged, 0 unstaged,
+0 untracked)" — so nothing moves under the cursor when the tree becomes clean.
 
 Creating is available in a usable repository **until the session is inside a
 worktree**. Once it is, the `⋯` menu's **创建 worktree** entry is disabled, with
@@ -104,24 +112,55 @@ old way, tries the jump anyway, and otherwise tells you where to find it. The
 `git_worktree` tool and `/worktree create` have no browser at all, so they keep
 starting the session on the Host and still register the directory as a workspace.
 
-A `⋯` menu beside it carries the secondary actions: create (disabled, with the
-reason, once the session is already inside a worktree), deliver, open that
-worktree's session, open the folder in the file manager, start in *another*
-repository, and discard the worktree. Both ways into a merge — the primary button
-and the menu's **合并回原分支** entry — open the **same question** described below,
-so the two can never disagree about what a merge does.
+A `⋯` menu beside the buttons carries the same two verbs — **提交** and
+**合并到原分支** — plus the secondary actions: create (disabled, with the reason,
+once the session is already inside a worktree), jump to one of this plugin's other
+worktrees, open the folder in the file manager, start in *another* repository, and
+discard the worktree. Every way into a merge — the button and the menu entry —
+opens the **same question** described below, so the two can never disagree about
+what a merge does.
+
+## Committing is its own button
+
+An agent's work sits uncommitted between turns, and a merge of uncommitted work is
+a merge of nothing. The plugin used to paper over that: a delivery would silently
+checkpoint the worktree first (`autoCommit`). That is still the fallback for
+callers that cannot press anything — the `git_worktree` tool and `/worktree
+deliver` — but the UI now offers the decision instead of taking it.
+
+**提交 · N** commits everything uncommitted in the directory the session is
+standing in: the worktree when there is one, the repository root otherwise (a
+branch in the main tree has the same problem with fewer steps). The subject is
+generated from the changed file names (`wip: dsh worktree checkpoint: app.txt,
+feature.txt +1`), and the commit is an ordinary one:
+
+* `git add --all --force -- .` — the same staging a delivery checkpoint does,
+  `--force` included, so an ignored build artifact is not silently dropped;
+* `git commit -m <subject> --` — **without `--no-verify`**. A repository's own
+  `pre-commit` hook (this machine's init template installs a gitleaks scanner
+  into every new repository) exists to stop exactly this kind of commit, and
+  skipping it would be this plugin deciding that your guard does not apply. A
+  hook refusal is reported as `hook-rejected`, and nothing is committed;
+* nothing is staged before the decision: a clean tree is refused with
+  `nothing-to-commit` rather than turned into an empty commit, and a missing
+  `user.email` is diagnosed *before* `git add` rather than after (`identity-missing`).
+
+The counts on the button come from the Host (`status.commit`: `changes`, `staged`,
+`unstaged`, `untracked`), which is also what decides whether the button is live.
+Nothing is committed without a click, and the click reports the subject it wrote,
+because the subject was generated rather than typed.
 
 ## Merging asks about the worktree, and the default is to remove it
 
 A merge used to decide the worktree's fate on its own, through the `autoCleanup`
 flag: the directory and its `dsh/wt/*` branch disappeared the moment the commits
 landed. The worktree is where the session lives, so that is now the user's call.
-Pressing **合并回 &lt;branch&gt; · N** opens a one-step question:
+Pressing **合并 · N** opens a one-step question:
 
 | Entry | What it does |
 |---|---|
-| **合并并删除 worktree（默认）** | merges, then removes the directory and its own branch (with `git branch -d`: a branch whose commits are not merged survives) |
-| **合并但保留 worktree** | merges, and leaves both the directory and the branch alone |
+| **合并并删除（默认）** | merges, then removes the directory and its own branch (with `git branch -d`: a branch whose commits are not merged survives) |
+| **合并但保留** | merges, and leaves both the directory and the branch alone |
 | **取消** | closes the question; nothing was merged, so nothing was lost |
 
 Removal is what happens if you simply confirm: it is the **first** entry, it is
@@ -161,12 +200,13 @@ the base branch, a second delivery is refused with `already-merged`.
 * **Never touches a remote.** No `fetch`, no `push`, no `remote add`. There is a
   test that asserts `git remote -v` is empty and no `remote.*` config exists
   after a full create → work → deliver cycle.
-* **Never skips your hooks.** The automatic checkpoint commit runs *with*
-  `pre-commit` hooks enabled. If a repository's hook (a secret scanner, a
-  linter) refuses the commit, that is reported as a failure — the plugin does not
-  decide that your gitleaks hook does not apply.
-* **Never commits on your behalf without being asked.** A commit happens only at
-  delivery time, only if the worktree still has uncommitted work, and only
+* **Never skips your hooks.** Both the **提交** button and the automatic
+  checkpoint commit run *with* `pre-commit` hooks enabled. If a repository's hook
+  (a secret scanner, a linter) refuses the commit, that is reported as a failure —
+  the plugin does not decide that your gitleaks hook does not apply.
+* **Never commits on your behalf without being asked.** The button is the only
+  way to commit from the UI, and it is a click. The one automatic commit happens
+  at delivery time, only if the worktree still has uncommitted work, and only
   because `autoCommit` is on (it is; set it false to be refused instead).
 * **Never deletes a worktree with uncommitted changes** during cleanup. Forced
   removal happens only through the explicit **discard** action, whose menu entry
@@ -187,9 +227,9 @@ is discovered automatically from the package's `dsh.client` section.
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Keep the surfaces but refuse every action with a reason. |
-| `autoCommit` | `true` | Commit leftover worktree work before merging (a commit subject is generated from the changed file names). |
+| `autoCommit` | `true` | Commit leftover worktree work before merging (a commit subject is generated from the changed file names). The **提交** button makes this fallback rarely needed; it still covers the `git_worktree` tool and `/worktree deliver`. |
 | `autoCleanup` | `true` | The answer the **surfaces that cannot ask** use — the `git_worktree` tool and `/worktree deliver` — and the fallback for a `POST /deliver` that sends no `cleanup`. The button always asks and sends the answer explicitly; removal stays the default either way. |
-| `commitMessage` | `wip: dsh worktree checkpoint` | Subject for the automatic commit. |
+| `commitMessage` | `wip: dsh worktree checkpoint` | Prefix of the generated subject, used by both the button and the automatic checkpoint. |
 | `registerTool` | `true` | Expose the `git_worktree` tool to the agent. |
 | `worktreeLayout` | `inside` | Where a worktree lands: `inside` = `<repo>\.dsh-worktrees\<repo>_<id>` (nests under the repository in the sidebar's Workspace Tree grouping, and the container is added to `.git/info/exclude`); `sibling` = `<parent>\<repo>_worktrees\<repo>_<id>`. |
 | `gitTimeoutMs` | `60000` | Wall-clock budget for one git command. |
@@ -197,21 +237,30 @@ is discovered automatically from the package's `dsh.client` section.
 
 ## Three surfaces, one implementation
 
-* **The button** — `GET /api/dsh-local-worktree/{status,workspaces,health}` and
-  `POST /api/dsh-local-worktree/{create,deliver,discard,open,session}`. Every
-  answer is JSON with `ok` and, on refusal, a stable `reason` code and a bilingual
-  `reasonText`, so the UI never prints raw git output at you. `POST /create` takes
-  `session: "client" | "host" | "none"` (default `client`: the browser registers the
-  workspace and starts the session; `host` starts it here, for the tool and the
-  command; `none` creates the directory only), and `POST /session` starts a session
-  in an existing worktree for a caller that cannot. `POST /deliver` takes
-  `cleanup: boolean` — the answer to the merge question — and defaults to
-  `autoCleanup` (remove) when it is absent.
-* **The tool** — `git_worktree` with `action: status | create | deliver | discard`.
-  The agent can isolate its own work instead of being told to; `deliver` takes the
-  same `cleanup: false` to keep the worktree.
-* **The command** — `/worktree`, `/worktree create`, `/worktree deliver [keep]`.
-  A typed command has no popover to ask in, so keeping is an argument.
+* **The buttons** — `GET /api/dsh-local-worktree/{status,workspaces,health}` and
+  `POST /api/dsh-local-worktree/{create,commit,deliver,discard,open,session}`.
+  Every answer is JSON with `ok` and, on refusal, a stable `reason` code and a
+  bilingual `reasonText`, so the UI never prints raw git output at you.
+  `POST /create` takes `session: "client" | "host" | "none"` (default `client`:
+  the browser registers the workspace and starts the session; `host` starts it
+  here, for the tool and the command; `none` creates the directory only), and
+  `POST /session` starts a session in an existing worktree for a caller that
+  cannot. `POST /commit` takes an optional `message` and answers the subject it
+  actually wrote; it refuses a clean tree with `nothing-to-commit` and a missing
+  identity with `identity-missing`. `POST /deliver` takes `cleanup: boolean` — the
+  answer to the merge question — and defaults to `autoCleanup` (remove) when it is
+  absent.
+  The `status` payload carries both decisions: `action` (the primary verb) and
+  `commit` (`enabled`, `reason`, `reasonText`, `changes`, `staged`, `unstaged`,
+  `untracked`, `path`), so the buttons render a decision instead of deriving one.
+* **The tool** — `git_worktree` with
+  `action: status | commit | create | deliver | discard`. The agent can isolate its
+  own work *and* commit it instead of being told to reach for a shell; `commit`
+  takes an optional `message`, and `deliver` takes the same `cleanup: false` to
+  keep the worktree.
+* **The command** — `/worktree`, `/worktree create`, `/worktree commit [subject]`,
+  `/worktree deliver [keep]`. The rest of a `commit` line is the subject, kept as
+  typed; a typed command has no popover to ask in, so keeping is an argument.
 
 ## Reloading after an update
 
@@ -301,17 +350,20 @@ node --test "test/**/*.test.mjs"
 the suite is named by glob; it also keeps `test/fixture.mjs`, a helper rather than
 a suite, out of the run.)
 
-115 tests. The repository and operation suites run **real git** in throwaway
+126 tests. The repository and operation suites run **real git** in throwaway
 repositories under the OS temp directory — no mocked child process — and the
 implementation suite drives the actual HTTP route handlers with synthetic
 requests. The assertions are about the promises above: a fast-forward stays
 linear, a diverged base gets a real merge commit with two parents, a conflicted
 delivery restores the main tree byte-for-byte, a refused cleanup loses nothing,
 `cleanup: false` keeps the directory, the branch and the plugin's own record of
-it, and the inside layout leaves `git status` clean. The client suite mounts the
-browser half against a React stand-in and asserts the two calls that join a new
-worktree — register the workspace, then open its session — in that order, the
-degradation path when the composition has no `workspaces` service, and the merge
-question: that a merge click asks *before* it merges, that the default answer is
-the one that removes the worktree (first, marked, focused), and that choosing to
-keep sends `cleanup: false`.
+it, and the inside layout leaves `git status` clean. An explicit commit lands on
+the worktree's branch (so it is still deliverable as one), keeps an ignored
+artifact, honours a given subject, and refuses a clean tree instead of writing an
+empty commit. The client suite mounts the browser half against a React stand-in
+and asserts the two calls that join a new worktree — register the workspace, then
+open its session — in that order, the degradation path when the composition has no
+`workspaces` service, that **commit and merge are two buttons** whose states come
+from the host's own decisions, and the merge question: that a merge click asks
+*before* it merges, that the default answer is the one that removes the worktree
+(first, marked, focused), and that choosing to keep sends `cleanup: false`.

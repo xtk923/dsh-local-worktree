@@ -33,6 +33,8 @@ export const REASONS = {
 	'main-head-moved-refuse': BOTH('原分支已经被别人推进了，先同步再合并', 'the base branch moved — reconcile it before merging'),
 	'worktree-missing': BOTH('worktree 目录不在了', 'the worktree directory is gone'),
 	'worktree-dirty': BOTH('worktree 里有未提交改动', 'the worktree has uncommitted changes'),
+	'nothing-to-commit': BOTH('没有需要提交的改动', 'nothing to commit'),
+	'commit-failed': BOTH('提交失败', 'the commit failed'),
 	'worktree-conflicted': BOTH('worktree 里有一次没做完的合并', 'the worktree has an unfinished merge'),
 	'no-new-commits': BOTH('这个 worktree 还没有提交任何东西，没有可合并的内容', 'nothing has been committed in this worktree yet, so there is nothing to merge'),
 	'uncommitted-changes': BOTH('只有未提交改动，会先自动提交一次', 'only uncommitted changes — they will be committed first'),
@@ -99,6 +101,21 @@ export function bothText(code) {
 /** Where a created worktree lives, as a sentence. */
 export function createdText({ path, branch }) {
 	return BOTH(`已创建 worktree：${path}（分支 ${branch}）`, `worktree created: ${path} (branch ${branch})`);
+}
+
+/**
+ * The outcome of one explicit commit, as a sentence.
+ *
+ * The subject is quoted because it was generated from the file names rather than
+ * typed by the user: seeing it after the fact is how they learn what the button
+ * wrote into their history.
+ */
+export function committedText({ message, changes }) {
+	const count = Number(changes) || 0;
+	return BOTH(
+		`已提交 ${count} 处改动：${message}`,
+		`committed ${count} change(s): ${message}`
+	);
 }
 
 /** The outcome of one merge, as a sentence. */
