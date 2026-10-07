@@ -333,7 +333,7 @@ function stubFetch(routes, calls) {
 }
 
 /** Mount the control with the services and route answers a Web page would give it. */
-async function mountControl({ services = {}, cwd = undefined, routes = null } = {}) {
+async function mountControl({ services = {}, cwd = undefined, session = {}, routes = null } = {}) {
 	const calls = [];
 	// Filled in by the test once its route answers exist; the bundle's `fetch` reads
 	// through this, because it lives in its own VM context.
@@ -375,12 +375,27 @@ async function mountControl({ services = {}, cwd = undefined, routes = null } = 
 	// therefore go in before mounting; the picker tests install theirs afterwards,
 	// which is correct for a control that starts with no cwd at all.
 	if (routes !== null) fetcher.current = stubFetch(routes, calls);
+	// The store the control subscribes to. It is handed over as-is (not copied) so a
+	// test can MOVE a session — the turn ending, a new prompt — and re-render, which
+	// is the only way to exercise the clock that decides when git state is re-read.
+	const store = cwd === undefined
+		? { byId: {}, ids: [] }
+		: { byId: { 'session-me': { cwd, ...session } }, ids: ['session-me'] };
 	const props = {
 		sessionId: 'session-me',
-		useSessions: (select) => select(cwd === undefined ? { byId: {}, ids: [] } : { byId: { 'session-me': { cwd } }, ids: [] })
+		useSessions: (select) => select(store)
 	};
 	await driver.mount(component, props);
-	return { driver, calls, component, props, useFetch: (impl) => { fetcher.current = impl; } };
+	return {
+		driver,
+		calls,
+		component,
+		props,
+		store,
+		/** Render again with the current store — what a store notification does. */
+		rerender: () => driver.mount(component, props),
+		useFetch: (impl) => { fetcher.current = impl; }
+	};
 }
 
 /** The create click, start to finish: picker → repository → the answer. */
@@ -766,4 +781,74 @@ test('the menu offers the same two verbs as the row', async () => {
 	const labels = entries.map(textOf);
 	assert.ok(labels.some((label) => label.includes('提交 / commit')), 'the menu can commit too');
 	assert.ok(labels.some((label) => label.includes('合并到原分支')), 'and merge');
+});
+
+/* ---------------------------------------------------- when git state is read -- */
+
+/** How many times the control has read this directory's git state. */
+const statusReads = (harness) => harness.calls.filter((entry) => entry.path === statusRoute(WORKTREE_PATH)).length;
+
+/**
+ * The staleness this control shipped with.
+ *
+ * It read git state once, at mount, and after its OWN clicks. An agent's turn is
+ * neither: the files it writes and the commits it makes changed the directory while
+ * the row kept rendering the snapshot from when the session was opened — "提交 · 0"
+ * over a dirty tree — until the user switched to another conversation and back,
+ * which remounted the control and happened to re-read. The store's own clock for the
+ * session (`api-session/status`) is the signal that fixes it.
+ */
+test('the agent\'s turn ending re-reads git state instead of leaving the row stale', async () => {
+	const routes = { [statusRoute(WORKTREE_PATH)]: insideWorktreeStatus(undefined, { commitChanges: 0 }) };
+	const harness = await mountControl({
+		cwd: WORKTREE_PATH,
+		session: { running: true, updatedAt: 10 },
+		routes
+	});
+	assert.equal(statusReads(harness), 1, 'the mount is the first read');
+	assert.equal(commitOf(harness.driver.tree).props.disabled, true, 'nothing was dirty when the session was opened');
+
+	// The turn ends: the Host publishes `api-session/status`, the store moves, and
+	// the worktree now holds what the agent did during that turn.
+	harness.store.byId['session-me'].running = false;
+	routes[statusRoute(WORKTREE_PATH)] = insideWorktreeStatus(undefined, { commitChanges: 2 });
+	await harness.rerender();
+
+	const commit = commitOf(harness.driver.tree);
+	assert.equal(statusReads(harness), 2, 'the turn boundary is what re-reads the directory');
+	assert.equal(commit.props.disabled, false, 'the re-read is what makes the button live');
+	assert.match(textOf(commit), /提交 · 2/, 'and the count on it is the new one');
+});
+
+test('a recorded prompt is the other movement that re-reads', async () => {
+	// `api-session/activity` advances when a durable user message lands: the prompt
+	// is the moment a session moves without its turn having ended yet.
+	const routes = { [statusRoute(WORKTREE_PATH)]: insideWorktreeStatus(undefined, { commitChanges: 0 }) };
+	const harness = await mountControl({
+		cwd: WORKTREE_PATH,
+		session: { running: false, updatedAt: 10 },
+		routes
+	});
+
+	harness.store.byId['session-me'].updatedAt = 20;
+	routes[statusRoute(WORKTREE_PATH)] = insideWorktreeStatus(undefined, { commitChanges: 1 });
+	await harness.rerender();
+
+	assert.equal(statusReads(harness), 2);
+	assert.match(textOf(commitOf(harness.driver.tree)), /提交 · 1/);
+});
+
+test('a re-render that carries no session movement does not re-read git state', async () => {
+	// The row re-renders as often as the page does. Reading git state on each of
+	// those renders would turn a store notification into a git status loop, so the
+	// clock is a dependency rather than an unconditional effect.
+	const harness = await mountControl({
+		cwd: WORKTREE_PATH,
+		session: { running: false, updatedAt: 7 },
+		routes: { [statusRoute(WORKTREE_PATH)]: insideWorktreeStatus(undefined, { commitChanges: 1 }) }
+	});
+
+	await harness.rerender();
+	await harness.rerender();
+	assert.equal(statusReads(harness), 1, 'one directory, one read, until something says it moved');
 });

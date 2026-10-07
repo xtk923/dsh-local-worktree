@@ -120,6 +120,27 @@ discard the worktree. Every way into a merge — the button and the menu entry �
 opens the **same question** described below, so the two can never disagree about
 what a merge does.
 
+### When the control re-reads git state
+
+The row renders a decision about a **directory**, and the agent changes that
+directory while the session runs — so a read taken once, at mount, is a snapshot
+that goes stale exactly when it starts to matter. The control therefore re-reads
+whenever **the session moves**, read off the session store the composer slot is
+handed (never a timer, and never its own clicks alone):
+
+| Signal | What moved |
+|---|---|
+| `cwd` | the session was pointed at another directory |
+| `running` (Host event `api-session/status`) | a turn started — and, the one that matters, **ended**, so what the agent wrote and committed is on disk now |
+| `updatedAt` (Host event `api-session/activity`) | a durable user message was recorded, the other moment a session moves |
+
+Nothing polls, and a re-render that carries no movement reads nothing: the clock is
+a dependency of the read, not an unconditional effect. A read that a newer one
+supersedes is aborted, so two answers cannot race into the row. Before this, the
+counts were read at mount and after the control's own clicks only — which is why a
+button could sit on `提交 · 0` over a dirty worktree until you switched to another
+conversation and back (that remount happened to re-read).
+
 ## Committing is its own button
 
 An agent's work sits uncommitted between turns, and a merge of uncommitted work is
@@ -350,7 +371,7 @@ node --test "test/**/*.test.mjs"
 the suite is named by glob; it also keeps `test/fixture.mjs`, a helper rather than
 a suite, out of the run.)
 
-126 tests. The repository and operation suites run **real git** in throwaway
+129 tests. The repository and operation suites run **real git** in throwaway
 repositories under the OS temp directory — no mocked child process — and the
 implementation suite drives the actual HTTP route handlers with synthetic
 requests. The assertions are about the promises above: a fast-forward stays
@@ -364,6 +385,9 @@ empty commit. The client suite mounts the browser half against a React stand-in
 and asserts the two calls that join a new worktree — register the workspace, then
 open its session — in that order, the degradation path when the composition has no
 `workspaces` service, that **commit and merge are two buttons** whose states come
-from the host's own decisions, and the merge question: that a merge click asks
+from the host's own decisions, the merge question: that a merge click asks
 *before* it merges, that the default answer is the one that removes the worktree
-(first, marked, focused), and that choosing to keep sends `cleanup: false`.
+(first, marked, focused), and that choosing to keep sends `cleanup: false` — and
+the clock the row reads: moving the session's own store (a turn ending, a recorded
+prompt) re-reads git state, while a re-render that carries no movement reads
+nothing.

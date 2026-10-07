@@ -31,6 +31,12 @@
  *                                  a question whose DEFAULT is to remove it
  *   not a repository            → render nothing at all
  *
+ * The state it renders is a decision about a DIRECTORY, and the agent keeps changing
+ * that directory while the session runs. A read at mount would therefore be a
+ * snapshot that goes stale the moment a turn ends, so every read is tied to the
+ * session's own clock (`turnRunning`, `activity` below): the turn boundary is what
+ * re-reads git state, not a click and not a timer.
+ *
  * Navigation is the two calls the sidebar makes for ITSELF, in this order:
  * `workspaces.create({ path })` registers the new worktree directory as a DSH
  * Workspace — which is what puts it in the sidebar at all, and what makes its
@@ -402,6 +408,39 @@ window.__ModuleLoader__.load({
 				? useSessions((state) => (sessionId && state.byId[sessionId] ? state.byId[sessionId].cwd : undefined))
 				: undefined;
 
+			/**
+			 * The session's own clock: what the store has learned about THIS session
+			 * since this control last read a directory.
+			 *
+			 * One read at mount is a SNAPSHOT, and this control renders a decision
+			 * about a directory that the agent changes under it: during a turn files
+			 * are written and commits are made. None of that arrives as a click, so
+			 * without a clock the row keeps rendering what was true when the session
+			 * was opened — the button says "提交 · 0" over a dirty tree until the user
+			 * switches to another conversation and back, which remounts the control
+			 * and happens to re-read.
+			 *
+			 * Both facts below are published by the Host and merely read here; the
+			 * plugin invents no liveness of its own and polls nothing:
+			 *
+			 *   `running`    the agent's turn started or ended (`api-session/status`).
+			 *                The transition to false is the moment the directory has
+			 *                just changed and the user looks at the row again.
+			 *   `updatedAt`  a durable user-authored message was recorded
+			 *                (`api-session/activity`) — the other moment the session
+			 *                moved, and the one that covers a prompt already queued.
+			 *
+			 * Both are selected as PRIMITIVES on purpose: this hook is a store
+			 * subscription, and a selector returning a fresh object per render would
+			 * re-render forever.
+			 */
+			const turnRunning = useSessions
+				? useSessions((state) => (sessionId && state.byId[sessionId] ? state.byId[sessionId].running === true : false))
+				: false;
+			const activity = useSessions
+				? useSessions((state) => (sessionId && state.byId[sessionId] ? Number(state.byId[sessionId].updatedAt) || 0 : 0))
+				: 0;
+
 			const [status, setStatus] = React.useState(null);
 			const [repos, setRepos] = React.useState(null);
 			const [phase, setPhase] = React.useState('idle');
@@ -411,24 +450,39 @@ window.__ModuleLoader__.load({
 			const [menu, setMenu] = React.useState(false);
 			const mounted = React.useRef(true);
 			const generation = React.useRef(0);
+			// The read that is in flight, so a newer one supersedes it instead of
+			// racing it to the state.
+			const inflight = React.useRef(null);
 
 			React.useEffect(() => () => { mounted.current = false; }, []);
 
 			/** Re-read this directory's state. Only the newest answer may win. */
 			const refresh = React.useCallback(async () => {
-				if (!cwd) { setStatus(null); return undefined; }
+				if (!cwd) { generation.current += 1; setStatus(null); return; }
 				const mine = ++generation.current;
+				if (inflight.current !== null) inflight.current.abort();
 				const controller = new AbortController();
+				inflight.current = controller;
 				const value = await call(`status?cwd=${encodeURIComponent(cwd)}`, { signal: controller.signal });
+				// A superseded read answers a question nobody is asking any more; the
+				// only thing it may do is stop.
+				if (controller.signal.aborted) return;
+				if (inflight.current === controller) inflight.current = null;
 				if (mounted.current && mine === generation.current) setStatus(value);
-				return () => controller.abort();
 			}, [cwd]);
 
+			/**
+			 * Read once per directory, and again whenever the session moves.
+			 *
+			 * The session clock belongs in THIS dependency list rather than in a
+			 * subscription of its own, and the difference matters: an extra effect
+			 * would fire a second read on mount, while a dependency only fires when
+			 * something actually moved. One directory, one read — until the turn ends.
+			 */
 			React.useEffect(() => {
-				let cancel;
-				refresh().then((dispose) => { cancel = dispose; });
-				return () => { if (typeof cancel === 'function') cancel(); };
-			}, [cwd, refresh]);
+				void refresh();
+				return () => { if (inflight.current !== null) inflight.current.abort(); };
+			}, [cwd, turnRunning, activity, refresh]);
 
 			const loadRepos = React.useCallback(async () => {
 				const value = await call('workspaces');
