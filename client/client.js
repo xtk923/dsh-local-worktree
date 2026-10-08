@@ -263,7 +263,10 @@ window.__ModuleLoader__.load({
 				// names the state rather than the branch: "worktree · master" told the
 				// user nothing about why there was nothing to click.
 				if (ahead > 0) return `合并 · ${ahead}`;
-				if (worktree.dirty) return '待提交';
+				// Uncommitted work is deliverable — the click checkpoints it first — so
+				// the label names the ACTION and the state together. "待提交" alone read
+				// as a reason not to press a button that was in fact enabled.
+				if (worktree.dirty) return '合并 · 待提交';
 				return '无新提交';
 			}
 			return status.repo.branch ? `创建 worktree · ${status.repo.branch}` : '创建 worktree';
@@ -300,6 +303,17 @@ window.__ModuleLoader__.load({
 					`分支 / branch: ${worktree.branch ? worktree.branch : '?'} → ${status.repo.branch || '?'}`
 				];
 				if (ahead > 0 && status.merge && status.merge.text) parts.push(status.merge.text);
+				// Uncommitted worktree work is NOT lost and NOT refused: the click commits
+				// it as a checkpoint first, then merges. That is a write to the user's
+				// history, so it is said BEFORE the click rather than reported after it —
+				// and when the Host is configured to force `.gitignore`d paths in as well,
+				// THAT is named too, because those paths are routinely secrets.
+				if (worktree.dirty === true) {
+					parts.push('', '有未提交改动：点合并会先自动提交一次 / uncommitted changes — the click commits them first');
+					if (status.commitIgnoredArtifacts === true) {
+						parts.push('（本机配置会把 .gitignore 里的文件一起提交）/ this build also commits ignored files');
+					}
+				}
 				// The click asks before it merges; saying so here is the only warning
 				// available BEFORE the question covers the button.
 				if (status.action.enabled === true) {
@@ -572,14 +586,24 @@ window.__ModuleLoader__.load({
 				const repo = (status && status.repo) || {};
 				const ahead = worktree.ahead ? worktree.ahead : 0;
 				const base = repo.branch || '?';
+				// Uncommitted work becomes a checkpoint commit, so it is part of what this
+				// merge delivers: the question counts it instead of saying "0 commit(s)"
+				// over a worktree that plainly holds work.
+				const pending = worktree.dirty === true;
+				const counted = ahead + (pending ? 1 : 0);
 				const onMerge = (cleanup) => {
 					setMenu(false);
 					void run('deliver', { cleanup }, deliverNotice);
 				};
 				return [
 					h('div', { key: 'head', className: 'dshwt-head' },
-						`合并 ${ahead} 个提交到 ${base}，worktree 怎么处理？`,
-						h('span', { className: 'dshwt-sub' }, `merge ${ahead} commit(s) into ${base} — what about the worktree?`)),
+						`合并 ${counted} 个提交到 ${base}，worktree 怎么处理？`,
+						h('span', { className: 'dshwt-sub' },
+							`merge ${counted} commit(s) into ${base} — what about the worktree?`),
+						pending
+							? h('span', { className: 'dshwt-sub' },
+								`（含 1 个先自动提交的 checkpoint${status.commitIgnoredArtifacts === true ? '，会把 .gitignore 的文件一起提交' : ''}）/ includes one checkpoint commit made first${status.commitIgnoredArtifacts === true ? ', ignored files included' : ''}`)
+							: null),
 					option('deliver-remove', '合并并删除（默认）/ merge, then remove',
 						'删除目录和它自己的分支 / removes the directory and its own branch',
 						() => onMerge(true),

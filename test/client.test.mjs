@@ -708,6 +708,54 @@ test('the menu entry for deliver asks the same question as the button', async ()
 	assert.match(textOf(harness.driver.tree), /未能删除|could not be removed/);
 });
 
+/* ------------------------------------- uncommitted work, said BEFORE the click -- */
+
+/** A worktree holding ONLY uncommitted work: deliverable, with `ahead` 0. */
+const DIRTY_ONLY_STATUS = {
+	...insideWorktreeStatus(undefined),
+	worktree: {
+		...insideWorktreeStatus(undefined).worktree,
+		ahead: 0, deliverable: true, state: 'uncommitted-only', reason: 'uncommitted-changes',
+		dirty: true, modified: 1
+	},
+	commit: { ...insideWorktreeStatus(undefined).commit, enabled: true, reason: 'ok', reasonText: 'ready', changes: 1, unstaged: 1 },
+	action: { kind: 'deliver', enabled: true, reason: 'ready' }
+};
+
+test('uncommitted work is disclosed before the merge, not discovered after it', async () => {
+	const harness = await mountControl({
+		cwd: WORKTREE_PATH,
+		routes: { [statusRoute(WORKTREE_PATH)]: DIRTY_ONLY_STATUS }
+	});
+
+	// The button says the ACTION and the state together: a merge that will commit
+	// first. "待提交" on its own read as a reason not to press an ENABLED button.
+	const primary = primaryOf(harness.driver.tree);
+	assert.equal(primary.props.disabled, false, 'uncommitted work is deliverable — the click checkpoints it');
+	assert.match(textOf(primary), /合并 · 待提交/);
+	assert.match(primary.props.title, /点合并会先自动提交一次|commits them first/);
+
+	// The question counts the commit the merge is about to make, instead of asking
+	// about "0 commit(s)" over a worktree that plainly holds work.
+	await harness.driver.click(primary);
+	assert.deepEqual(harness.calls.map((entry) => entry.path), [statusRoute(WORKTREE_PATH)], 'asking merges nothing');
+	assert.match(questionOf(harness.driver.tree), /合并 1 个提交/, 'the checkpoint is counted');
+	assert.match(questionOf(harness.driver.tree), /含 1 个先自动提交的 checkpoint/);
+});
+
+test('a build that forces ignored files in says so before the click', async () => {
+	const harness = await mountControl({
+		cwd: WORKTREE_PATH,
+		routes: { [statusRoute(WORKTREE_PATH)]: { ...DIRTY_ONLY_STATUS, commitIgnoredArtifacts: true } }
+	});
+
+	// The paths most often hidden by `.gitignore` are the ones a user would least want
+	// in history, so a build configured to include them names that up front.
+	assert.match(primaryOf(harness.driver.tree).props.title, /\.gitignore/);
+	await harness.driver.click(primaryOf(harness.driver.tree));
+	assert.match(questionOf(harness.driver.tree), /会把 \.gitignore 的文件一起提交/);
+});
+
 /* ------------------------------------------------------- the commit button -- */
 
 test('commit is its own button beside merge, and pressing it commits', async () => {
