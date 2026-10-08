@@ -49,6 +49,7 @@ import {
 	quotedFromGit,
 	repoKey,
 	samePath,
+	stageArgs,
 	statusArgs,
 	suggestCommitMessage,
 	within,
@@ -469,7 +470,7 @@ export class Workspace {
 	 *   4. on any failure the main tree is rolled back with `merge --abort` and
 	 *      the worktree is KEPT — a conflict must cost a retry, not the work.
 	 */
-	async deliver(repoRoot, entry, { base, message, cleanup = true, autoCommit = true } = {}) {
+	async deliver(repoRoot, entry, { base, message, cleanup = true, autoCommit = true, commitIgnored = false } = {}) {
 		const root = resolve(String(repoRoot));
 		const path = typeof entry === 'string' ? entry : entry?.path;
 		if (typeof path !== 'string' || path === '') throw new GitFailure('worktree-missing', '', { operation: 'deliver' });
@@ -510,6 +511,7 @@ export class Workspace {
 			worktreeDirty: worktreeStatus.dirty,
 			commitMessage,
 			autoCommit,
+			commitIgnored,
 			hasIdentity: worktreeStatus.dirty ? await this.hasIdentity(root) : true
 		});
 
@@ -585,17 +587,30 @@ export class Workspace {
 			return { ok: false, reason: 'git-error', detail: 'the merge did not land', aborted: true, kept: true };
 		}
 
-		const shape = describeMerge({ baseAhead: worktreeHead === null ? 0 : await this.count(root, `${worktreeHead}..${finalMainHead ?? 'HEAD'}`) });
+		// Whether a checkpoint commit was really made is read from the EXECUTED steps,
+		// not from the plan: a plan can carry a `preCommit` that staged nothing (a tree
+		// dirty only through ignored paths), and reporting a commit that git never made
+		// would put a number on the button's result that history does not contain.
+		const checkpointed = executed.some((step) => step.id === 'commit' && step.exitCode === 0);
+		// The shape is decided by whether the BASE had moved BEFORE the merge — that is
+		// the question `describeMerge` answers. Measuring it after the fact from the
+		// pre-merge worktree HEAD counts the checkpoint commit itself as "the base moved
+		// on", so every delivery that checkpointed work was reported as a merge commit
+		// even when git fast-forwarded it (verified: no merge commit in the history).
+		const shape = describeMerge({ baseAhead });
 		const summary = {
 			ok: true,
 			strategy: shape.strategy,
 			strategyText: shape.text,
 			base: baseBranch,
 			branch: plan.worktreeBranch,
-			commits: ahead,
+			// The checkpoint commit IS one of the commits this delivery brings to the
+			// base branch, so leaving it out under-reported a successful merge as
+			// "0 commit(s)" — the count the user reads after the click.
+			commits: ahead + (checkpointed ? 1 : 0),
 			mainHead: finalMainHead,
 			worktreeHead,
-			preCommitted: plan.preCommit !== null,
+			preCommitted: checkpointed,
 			executed
 		};
 
@@ -606,18 +621,21 @@ export class Workspace {
 	/**
 	 * Commit whatever is uncommitted in one directory — the button's own verb.
 	 *
-	 * Deliberately the SAME three steps the automatic checkpoint inside `deliver`
-	 * runs (`add --all --force -- .`, then `commit -m`), so pressing the button and
-	 * letting a delivery checkpoint the work produce the identical commit. Nothing
-	 * here is invented for the button: a repository's hooks run, no pathspec is
-	 * narrowed, and the subject comes from {@link suggestCommitMessage} over the
-	 * change list the caller already read.
+	 * Deliberately the SAME steps the automatic checkpoint inside `deliver` runs
+	 * (`stageArgs`, then `commit -m`), so pressing the button and letting a delivery
+	 * checkpoint the work produce the identical commit. Nothing here is invented for
+	 * the button: a repository's hooks run, no pathspec is narrowed, and the subject
+	 * comes from {@link suggestCommitMessage} over the change list the caller
+	 * already read.
+	 *
+	 * `commitIgnored` is passed through rather than defaulted here, so the default
+	 * (and its reasoning) lives in exactly one place — {@link stageArgs}.
 	 *
 	 * The refusals come BEFORE the stage, because staging is a write: a clean tree
 	 * would otherwise be turned into an empty commit attempt, and a missing
 	 * identity into a `git add` the user never asked for.
 	 */
-	async commit(cwd, { message } = {}) {
+	async commit(cwd, { message, commitIgnored = false } = {}) {
 		const where = resolve(String(cwd));
 		const status = await this.status(where);
 		if (status.dirty !== true) {
@@ -633,7 +651,10 @@ export class Workspace {
 			return { ok: false, reason: 'identity-missing', path: where, changes, message: subject };
 		}
 
-		const staged = await this.#run(where, gitArgs(['add', '--all', '--force', '--', '.'], { cwd: where }));
+		// The SAME argv the automatic checkpoint inside `deliver` uses, from the same
+		// function, so pressing the button and letting a delivery checkpoint the work
+		// can never commit different sets of files.
+		const staged = await this.#run(where, gitArgs(stageArgs({ forceIgnored: commitIgnored === true }), { cwd: where }));
 		if (staged.exitCode !== 0) {
 			return { ok: false, reason: classifyGitFailure(staged), detail: '', quoted: quotedFromGit(staged.stderr), path: where, changes };
 		}

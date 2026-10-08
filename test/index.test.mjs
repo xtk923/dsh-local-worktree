@@ -157,6 +157,9 @@ test('normalizeConfig fills defaults and rejects nonsense', () => {
 	assert.equal(defaults.enabled, true);
 	assert.equal(defaults.autoCommit, true);
 	assert.equal(defaults.autoCleanup, true);
+	// Off by default: forcing ignored paths into a checkpoint commit is what writes a
+	// `.env` into somebody's branch, so it is a deliberate opt-in.
+	assert.equal(defaults.commitIgnoredArtifacts, false);
 	assert.equal(defaults.registerTool, true);
 	assert.equal(defaults.gitTimeoutMs, 60_000);
 	assert.equal(defaults.commitMessage, 'wip: dsh worktree checkpoint');
@@ -550,6 +553,42 @@ test('POST deliver refuses a dirty main tree with a printable reason', async () 
 	assert.equal(answer.body.reason, 'main-dirty');
 	assert.match(answer.body.reasonText, /\u672a\u63d0\u4ea4|uncommitted/);
 	assert.equal(answer.body.kept, true);
+});
+
+test('POST deliver reports the commit it made, and does not force ignored paths in', async () => {
+	const root = await makeRepo({ name: 'impl-checkpoint' });
+	// The ignore rule is committed BEFORE the worktree is cut, so the base does not move
+	// and a delivery here is a plain fast-forward.
+	await writeFile(join(root, '.gitignore'), 'secret.env\n');
+	await git(root, ['add', '.gitignore']);
+	await commit(root, 'ignore');
+
+	const harness = await mount();
+	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root } });
+	const wt = created.body.created.path;
+	// An ignored secret beside a real edit: the shape that reaches a checkpoint commit.
+	await writeFile(join(wt, 'app.txt'), 'edited, never committed\n');
+	await writeFile(join(wt, 'secret.env'), 'TOKEN=super-secret\n');
+
+	// The status the button renders says what a click will do to the user's history.
+	const before = await call(harness, ROUTES.status, { query: { cwd: wt } });
+	assert.equal(before.body.commitIgnoredArtifacts, false, 'the default is stated, so the client can be honest');
+
+	const answer = await call(harness, ROUTES.deliver, { method: 'POST', body: { cwd: wt } });
+	assert.equal(answer.body.ok, true);
+	assert.equal(answer.body.preCommitted, true);
+	// One commit was delivered: the checkpoint this call made. Reporting 0 was the bug.
+	assert.equal(answer.body.commits, 1);
+	// The base never moved, so git fast-forwarded; the sentence must not claim a merge
+	// commit, and must not splice the two languages together.
+	assert.equal(answer.body.strategy, 'fast-forward');
+	assert.equal(
+		answer.body.text,
+		`已把 1 个提交快进到 main（来自 ${created.body.created.branch}） / 1 commit(s) fast-forwarded into main from ${created.body.created.branch}`
+	);
+	const tracked = (await git(root, ['ls-files'])).stdout.split(/\r?\n/).filter((line) => line !== '');
+	assert.equal(tracked.includes('app.txt'), true);
+	assert.equal(tracked.includes('secret.env'), false, 'an ignored secret is never written into the base branch');
 });
 
 test('POST deliver reports a conflict with the paths and a recovery hint', async () => {

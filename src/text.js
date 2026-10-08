@@ -118,14 +118,19 @@ export function committedText({ message, changes }) {
 	);
 }
 
-/** The outcome of one merge, as a sentence. */
+/**
+ * The outcome of one merge, as a sentence.
+ *
+ * The strategy picks a WORD inside each language rather than a bilingual fragment
+ * inside a bilingual sentence: `BOTH` is a `zh / en` join, so interpolating one
+ * `BOTH` result into another produced `已把 2 个提交快进 / fast-forwarded到 main`
+ * — two half-sentences fighting in both languages at once.
+ */
 export function deliveredText({ strategy, branch, base, commits }) {
-	const how = strategy === 'fast-forward'
-		? BOTH('快进', 'fast-forwarded')
-		: BOTH('merge commit', 'merged with a commit');
+	const fastForward = strategy === 'fast-forward';
 	return BOTH(
-		`已把 ${commits} 个提交${how}到 ${base}（来自 ${branch}）`,
-		`${commits} commit(s) ${how} into ${base} from ${branch}`
+		`已把 ${commits} 个提交${fastForward ? '快进' : '用一个 merge commit 合并'}到 ${base}（来自 ${branch}）`,
+		`${commits} commit(s) ${fastForward ? 'fast-forwarded' : 'merged with a commit'} into ${base} from ${branch}`
 	);
 }
 

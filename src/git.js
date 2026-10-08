@@ -640,7 +640,9 @@ export function classifyWorktree({
  *   4. the main working tree must be clean, because `git merge` refuses on a
  *      dirty tree anyway and a "sometimes works" button is worse than a
  *      diagnosed one;
- *   5. an unborn main branch has nothing to fast-forward from.
+ *   5. uncommitted worktree work WITH `autoCommit` off is named as such, before
+ *      the "already merged" test can mislabel it;
+ *   6. an unborn main branch has nothing to fast-forward from.
  */
 export function planMerge({
 	sameRepo = true,
@@ -653,6 +655,7 @@ export function planMerge({
 	worktreeDirty = false,
 	commitMessage,
 	autoCommit = true,
+	commitIgnored = false,
 	hasIdentity = true
 } = {}) {
 	const refuse = (reason, detail) => ({ ok: false, kind: 'refuse', reason, detail: detail ?? null });
@@ -668,14 +671,6 @@ export function planMerge({
 		return refuse('main-on-other-branch', `expected ${base}, found ${mainBranch}`);
 	}
 	if (mainStatus?.detached === true) return refuse('main-detached-head');
-	// Before the dirty check: if both sides are the same commit there is nothing
-	// to deliver, and saying THAT is more useful than complaining about a dirty
-	// tree. But a worktree whose only change is still uncommitted DOES have
-	// something to deliver, and the checkpoint commit below is what makes it
-	// deliverable — so this refusal must not pre-empt that commit.
-	if (same(mainHead, worktreeHead) && !(worktreeDirty === true && autoCommit === true)) {
-		return refuse('already-merged');
-	}
 	if (mainStatus?.dirty === true) {
 		return refuse('main-dirty', `${Number(mainStatus.staged ?? 0) + Number(mainStatus.unstaged ?? 0)} tracked, ${Number(mainStatus.untracked ?? 0)} untracked`);
 	}
@@ -684,8 +679,21 @@ export function planMerge({
 		? commitMessage.trim()
 		: null;
 
+	// Uncommitted worktree work is diagnosed BEFORE "already merged", because a
+	// worktree whose only work is still uncommitted is NOT already merged: the base
+	// does not contain it. Reading the same-commit test first reported that case as
+	// `already-merged` — "the base branch already contains every worktree commit" —
+	// which describes a merge that is nothing of the kind, when the user's next move
+	// is to commit, or to turn `autoCommit` on.
 	if (worktreeDirty === true && autoCommit !== true) {
 		return refuse('worktree-dirty', 'the worktree has uncommitted changes and autoCommit is off');
+	}
+	// Reaching here with a dirty worktree means `autoCommit` is ON, so the checkpoint
+	// commit below is what turns it into something deliverable and this refusal must
+	// not pre-empt it. With a clean worktree, identical heads really is "nothing to
+	// deliver", and saying THAT beats creating an empty merge commit.
+	if (same(mainHead, worktreeHead) && worktreeDirty !== true) {
+		return refuse('already-merged');
 	}
 	// Auto-committing without an identity fails with "Author identity unknown" —
 	// and on a machine whose global config has no user.name this is the NORMAL
@@ -703,10 +711,10 @@ export function planMerge({
 		worktreeBranch,
 		worktreeHead,
 		commitMessage: message,
-		// The caller turns this into an actual `add --all --force` + `commit`;
-		// planning it here keeps the argv and the decision in one place.
+		// The caller turns this into an actual staging `add` + `commit`; planning it
+		// here keeps the argv and the decision in one place.
 		preCommit: worktreeDirty === true
-			? { message: message ?? DEFAULT_COMMIT_MESSAGE }
+			? { message: message ?? DEFAULT_COMMIT_MESSAGE, forceIgnored: commitIgnored === true }
 			: null
 	};
 }
@@ -730,6 +738,27 @@ export function planAbort() {
 }
 
 /**
+ * argv for staging the checkpoint commit, in ONE place for both callers.
+ *
+ * `--force` is what makes `git add` accept paths that `.gitignore` excludes, and
+ * it is OFF by default. The reason is not tidiness: the same ignore rules that
+ * keep `node_modules/` out of a repository are the ones that keep a `.env` out of
+ * it, so a checkpoint commit that forces them in writes files the user
+ * deliberately excluded — secrets included — into the base branch's history,
+ * where they cannot be removed by a later click. It also made the commit disagree
+ * with the plugin's OWN verdict on the directory: `dirty` is decided with
+ * `--exclude-standard` (ignored paths do not count), so a forced staging step
+ * committed strictly more than the change list the button reported.
+ *
+ * `commitIgnored: true` restores the older behaviour for a caller who really
+ * wants a build artifact committed before the worktree is removed — that is a
+ * deliberate choice, so it is opt-in rather than the default.
+ */
+export function stageArgs({ forceIgnored = false } = {}) {
+	return ['add', '--all', ...(forceIgnored === true ? ['--force'] : []), '--', '.'];
+}
+
+/**
  * argv for the merge itself, in the order the sequence needs them.
  *
  * Every element is a separate argv item — including the pathspec `.` and each
@@ -741,7 +770,7 @@ export function mergeSteps(plan) {
 	if (plan?.ok !== true) throw new Error('mergeSteps requires a successful plan');
 	const steps = [];
 	if (plan.preCommit) {
-		steps.push({ id: 'stage', args: ['add', '--all', '--force', '--', '.'] });
+		steps.push({ id: 'stage', args: stageArgs({ forceIgnored: plan.preCommit.forceIgnored === true }) });
 		// No `--no-verify`: a repository's own hooks (this machine's init template
 		// installs a gitleaks pre-commit hook into every new repository) exist to
 		// stop exactly this kind of automated commit, and skipping them would be

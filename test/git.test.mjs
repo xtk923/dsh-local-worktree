@@ -34,6 +34,7 @@ import {
 	quotedFromGit,
 	repoKey,
 	samePath,
+	stageArgs,
 	suggestCommitMessage,
 	within,
 	worktreeContainer,
@@ -363,7 +364,7 @@ test('planMerge commits dirty worktree work first, then merges with an explicit 
 	assert.deepEqual(steps.map((step) => step.id), ['stage', 'commit', 'merge']);
 	// Every element is its own argv item, so a message that starts with a dash or
 	// contains a quote can never be read as an option.
-	assert.deepEqual(steps[0].args, ['add', '--all', '--force', '--', '.']);
+	assert.deepEqual(steps[0].args, ['add', '--all', '--', '.'], 'the checkpoint stages what `dirty` counted, and nothing else');
 	assert.deepEqual(steps[1].args, ['commit', '-m', 'wip: checkpoint', '--']);
 	// A repository's own hooks must still run: this machine's init template
 	// installs a gitleaks pre-commit hook, and bypassing it would be this plugin
@@ -477,6 +478,70 @@ test('planMerge refuses dirty worktree work when autoCommit is off', () => {
 	});
 	assert.equal(plan.ok, false);
 	assert.equal(plan.reason, 'worktree-dirty');
+});
+
+test('planMerge names uncommitted work as such even when both heads are the same commit', () => {
+	// The same-commit test used to run FIRST, so a worktree whose only work was still
+	// uncommitted came back as `already-merged` — "the base branch already contains
+	// every worktree commit" — which is the one thing about that state that is NOT
+	// true. The user's next move is to commit, so that is what they are told.
+	const plan = planMerge({
+		mainBranch: 'main',
+		mainStatus: { branch: 'main', head: 'a', dirty: false },
+		mainHead: 'a',
+		worktreeHead: 'a',
+		worktreeDirty: true,
+		autoCommit: false
+	});
+	assert.equal(plan.ok, false);
+	assert.equal(plan.reason, 'worktree-dirty');
+
+	// With autoCommit ON the same state IS deliverable: the checkpoint commit is what
+	// turns uncommitted work into something a merge can carry.
+	const commitFirst = planMerge({
+		mainBranch: 'main',
+		mainStatus: { branch: 'main', head: 'a', dirty: false },
+		mainHead: 'a',
+		worktreeHead: 'a',
+		worktreeDirty: true,
+		autoCommit: true
+	});
+	assert.equal(commitFirst.ok, true);
+	assert.equal(commitFirst.preCommit.message, 'wip: dsh worktree checkpoint');
+
+	// A CLEAN worktree on the same commit is still "nothing to deliver", and saying
+	// that beats creating an empty merge commit.
+	assert.equal(
+		planMerge({
+			mainBranch: 'main',
+			mainStatus: { branch: 'main', head: 'a', dirty: false },
+			mainHead: 'a',
+			worktreeHead: 'a',
+			worktreeDirty: false
+		}).reason,
+		'already-merged'
+	);
+});
+
+test('the checkpoint stage leaves ignored paths out unless the caller asks for them', () => {
+	// `--force` is exactly what makes `git add` accept paths `.gitignore` excludes,
+	// and those paths are where a `.env` and a `node_modules/` live.
+	assert.deepEqual(stageArgs(), ['add', '--all', '--', '.']);
+	assert.deepEqual(stageArgs({}), ['add', '--all', '--', '.']);
+	assert.deepEqual(stageArgs({ forceIgnored: false }), ['add', '--all', '--', '.']);
+	assert.deepEqual(stageArgs({ forceIgnored: true }), ['add', '--all', '--force', '--', '.']);
+
+	const plan = planMerge({
+		mainBranch: 'main',
+		mainStatus: { branch: 'main', head: 'a', dirty: false },
+		worktreeHead: 'b',
+		worktreeBranch: 'dsh/wt/x',
+		worktreeDirty: true,
+		commitIgnored: true
+	});
+	assert.equal(plan.preCommit.forceIgnored, true, 'the opt-in reaches the plan');
+	const stage = mergeSteps(plan).find((step) => step.id === 'stage');
+	assert.equal(stage.args.includes('--force'), true, 'and from the plan into the argv');
 });
 
 test('planMerge falls back to a default commit subject when none is supplied', () => {

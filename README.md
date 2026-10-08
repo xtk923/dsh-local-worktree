@@ -155,8 +155,12 @@ branch in the main tree has the same problem with fewer steps). The subject is
 generated from the changed file names (`wip: dsh worktree checkpoint: app.txt,
 feature.txt +1`), and the commit is an ordinary one:
 
-* `git add --all --force -- .` — the same staging a delivery checkpoint does,
-  `--force` included, so an ignored build artifact is not silently dropped;
+* `git add --all -- .` — the same staging a delivery checkpoint does, from the
+  same function, so the two can never commit different sets of files. Ignored
+  paths are **left out by default**: the ignore rules that keep `node_modules/`
+  out of a repository are the ones that keep a `.env` out of it, and a commit
+  cannot be taken back with another click. `commitIgnoredArtifacts: true` stages
+  them as well, for a build whose ignored output is the deliverable;
 * `git commit -m <subject> --` — **without `--no-verify`**. A repository's own
   `pre-commit` hook (this machine's init template installs a gitleaks scanner
   into every new repository) exists to stop exactly this kind of commit, and
@@ -251,6 +255,7 @@ is discovered automatically from the package's `dsh.client` section.
 | `autoCommit` | `true` | Commit leftover worktree work before merging (a commit subject is generated from the changed file names). The **提交** button makes this fallback rarely needed; it still covers the `git_worktree` tool and `/worktree deliver`. |
 | `autoCleanup` | `true` | The answer the **surfaces that cannot ask** use — the `git_worktree` tool and `/worktree deliver` — and the fallback for a `POST /deliver` that sends no `cleanup`. The button always asks and sends the answer explicitly; removal stays the default either way. |
 | `commitMessage` | `wip: dsh worktree checkpoint` | Prefix of the generated subject, used by both the button and the automatic checkpoint. |
+| `commitIgnoredArtifacts` | `false` | Stage paths `.gitignore` excludes in a checkpoint commit, so an ignored build artifact survives the worktree being removed. Off by default: those same paths are where secrets live, and a commit cannot be taken back. It can only ever widen a commit that was happening anyway — an ignored path on its own never counts as dirty. |
 | `registerTool` | `true` | Expose the `git_worktree` tool to the agent. |
 | `worktreeLayout` | `inside` | Where a worktree lands: `inside` = `<repo>\.dsh-worktrees\<repo>_<id>` (nests under the repository in the sidebar's Workspace Tree grouping, and the container is added to `.git/info/exclude`); `sibling` = `<parent>\<repo>_worktrees\<repo>_<id>`. |
 | `gitTimeoutMs` | `60000` | Wall-clock budget for one git command. |
@@ -371,23 +376,28 @@ node --test "test/**/*.test.mjs"
 the suite is named by glob; it also keeps `test/fixture.mjs`, a helper rather than
 a suite, out of the run.)
 
-129 tests. The repository and operation suites run **real git** in throwaway
+141 tests. The repository and operation suites run **real git** in throwaway
 repositories under the OS temp directory — no mocked child process — and the
 implementation suite drives the actual HTTP route handlers with synthetic
 requests. The assertions are about the promises above: a fast-forward stays
 linear, a diverged base gets a real merge commit with two parents, a conflicted
 delivery restores the main tree byte-for-byte, a refused cleanup loses nothing,
 `cleanup: false` keeps the directory, the branch and the plugin's own record of
-it, and the inside layout leaves `git status` clean. An explicit commit lands on
-the worktree's branch (so it is still deliverable as one), keeps an ignored
-artifact, honours a given subject, and refuses a clean tree instead of writing an
-empty commit. The client suite mounts the browser half against a React stand-in
-and asserts the two calls that join a new worktree — register the workspace, then
-open its session — in that order, the degradation path when the composition has no
-`workspaces` service, that **commit and merge are two buttons** whose states come
-from the host's own decisions, the merge question: that a merge click asks
-*before* it merges, that the default answer is the one that removes the worktree
-(first, marked, focused), and that choosing to keep sends `cleanup: false` — and
-the clock the row reads: moving the session's own store (a turn ending, a recorded
-prompt) re-reads git state, while a re-render that carries no movement reads
-nothing.
+it, and the inside layout leaves `git status` clean. A delivery that checkpointed
+uncommitted work reports the commit it made and still calls a fast-forward a
+fast-forward, while leaving both an ignored artifact and an ignored secret out of
+the branch. An explicit commit lands on the worktree's branch (so it is still
+deliverable as one), honours a given subject, refuses a clean tree instead of
+writing an empty commit, and takes ignored paths only when
+`commitIgnoredArtifacts` asks for them. The client suite mounts the browser half
+against a React stand-in and asserts the two calls that join a new worktree —
+register the workspace, then open its session — in that order, the degradation
+path when the composition has no `workspaces` service, that **commit and merge
+are two buttons** whose states come from the host's own decisions, that
+uncommitted work is disclosed *before* the click (the question counts the
+checkpoint commit it is about to make), the merge question: that a merge click
+asks *before* it merges, that the default answer is the one that removes the
+worktree (first, marked, focused), and that choosing to keep sends
+`cleanup: false` — and the clock the row reads: moving the session's own store (a
+turn ending, a recorded prompt) re-reads git state, while a re-render that
+carries no movement reads nothing.

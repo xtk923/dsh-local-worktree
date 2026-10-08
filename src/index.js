@@ -93,6 +93,11 @@ export const configSchema = {
 			type: 'boolean',
 			description: 'After a successful merge, remove the worktree and delete its own branch when it is fully merged.'
 		},
+		commitIgnoredArtifacts: {
+			type: 'boolean',
+			description:
+				'Stage paths `.gitignore` excludes in the checkpoint commit, so an ignored build artifact survives the worktree being removed. Off by default: the same ignore rules that keep `node_modules/` out of a repository are what keep a `.env` out of it, and a commit cannot be taken back with another click.'
+		},
 		commitMessage: { type: 'string', description: 'Subject used for the automatic checkpoint commit.' },
 		registerTool: { type: 'boolean', description: 'Expose the git_worktree tool to the agent.' },
 		worktreeLayout: {
@@ -116,6 +121,11 @@ export function normalizeConfig(raw) {
 		enabled: bool(input.enabled, true),
 		autoCommit: bool(input.autoCommit, true),
 		autoCleanup: bool(input.autoCleanup, true),
+		// OFF by default. `git add --all` already stages every tracked change and every
+		// untracked file that is not ignored, which is exactly the set the plugin
+		// reports as "dirty"; forcing the ignored paths in as well committed files the
+		// user excluded on purpose (a `.env`, a `node_modules/`) into their branch.
+		commitIgnoredArtifacts: bool(input.commitIgnoredArtifacts, false),
 		commitMessage: typeof input.commitMessage === 'string' && input.commitMessage.trim() !== ''
 			? input.commitMessage.trim()
 			: 'wip: dsh worktree checkpoint',
@@ -316,6 +326,9 @@ export async function buildStatus(api, cwd) {
 		version: 1,
 		cwd: directory,
 		enabled: api.config.enabled,
+		// Stated by the Host because it changes what a click will put in the user's
+		// history, and the client can only warn about what it is told.
+		commitIgnoredArtifacts: api.config.commitIgnoredArtifacts === true,
 		repo: {
 			present: state.repo.present === true,
 			usable: state.repo.usable === true,
@@ -655,6 +668,7 @@ export function createApi(ctx, rawConfig) {
 					base: entry.base,
 					message,
 					autoCommit: config.autoCommit,
+					commitIgnored: config.commitIgnoredArtifacts,
 					cleanup: typeof cleanup === 'boolean' ? cleanup : config.autoCleanup
 				});
 			} catch (error) {
@@ -732,7 +746,7 @@ export function createApi(ctx, rawConfig) {
 		const target = state0.worktree !== null && state0.worktree.present === true ? state0.worktree.path : state0.repoRoot;
 		if (typeof target !== 'string' || target === '') return { ok: false, reason: 'worktree-missing' };
 
-		const result = await workspace.commit(target, { message });
+		const result = await workspace.commit(target, { message, commitIgnored: config.commitIgnoredArtifacts });
 		if (result.ok !== true) {
 			return {
 				ok: false,
@@ -1036,6 +1050,7 @@ function attachRoutes(ctx, api) {
 		config: {
 			autoCommit: api.config.autoCommit,
 			autoCleanup: api.config.autoCleanup,
+			commitIgnoredArtifacts: api.config.commitIgnoredArtifacts,
 			registerTool: api.config.registerTool,
 			worktreeLayout: api.config.worktreeLayout,
 			gitTimeoutMs: api.config.gitTimeoutMs

@@ -21,5 +21,10 @@
         # After a successful merge, remove the worktree and delete its own branch
         # (`git branch -d`, so an unmerged branch survives).
         autoCleanup: true
+        # Stage paths `.gitignore` excludes in a checkpoint commit, so an ignored
+        # build artifact survives the worktree being removed. Off deliberately:
+        # those same paths are where a `.env` lives, and a commit cannot be taken
+        # back. It only widens a commit that was happening anyway.
+        commitIgnoredArtifacts: false
         registerTool: true
         gitTimeoutMs: 60000

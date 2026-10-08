@@ -234,20 +234,60 @@ test('deliver commits uncommitted worktree work first, so nothing is lost', asyn
 	const { root } = await repo({ name: 'autocommit' });
 	const created = await ws.create(root);
 	await writeFile(join(created.path, 'app.txt'), 'edited but never committed\n');
-	// An ignored artifact must survive too: it is often the agent's real output.
-	const { mkdir } = await import('node:fs/promises');
-	await mkdir(join(created.path, 'build'), { recursive: true });
-	await writeFile(join(created.path, '.gitignore'), 'build/\n');
-	await writeFile(join(created.path, 'build/out.bin'), 'artifact\n');
 
 	const result = await ws.deliver(root, created, { cleanup: false, message: 'wip: agent output' });
 	assert.equal(result.ok, true);
 	assert.equal(result.preCommitted, true);
+	// The count the user reads AFTER the click includes the commit that click made.
+	assert.equal(result.commits, 1);
+	// The checkpoint must not be reported as a merge commit: the base never moved, so
+	// git fast-forwarded, and the history must agree with the sentence.
+	assert.equal(result.strategy, 'fast-forward');
+	assert.equal(result.strategyText, '可以直接快进 / this will fast-forward');
+	assert.equal((await git(root, ['rev-list', '--count', '--merges', 'HEAD'])).stdout.trim(), '0', 'no merge commit was made');
 
 	const mainSubjects = await subjects(root);
 	assert.equal(mainSubjects[0], 'wip: agent output');
-	const tracked = await git(root, ['ls-files']);
-	assert.match(tracked.stdout, /build\/out\.bin/, 'an ignored artifact must not be dropped at merge time');
+});
+
+test('delivery does not force ignored paths into the base branch by default', async () => {
+	const { root } = await repo({ name: 'ignored-default' });
+	const created = await ws.create(root);
+	const { mkdir } = await import('node:fs/promises');
+	await mkdir(join(created.path, 'build'), { recursive: true });
+	await writeFile(join(created.path, '.gitignore'), 'build/\nsecret.env\n');
+	// An ignored artifact and an ignored secret beside a REAL edit, which is the only
+	// shape that reaches a checkpoint commit at all: `dirty` is decided with
+	// `--exclude-standard`, so ignored paths on their own never trigger one.
+	await writeFile(join(created.path, 'build/out.bin'), 'artifact\n');
+	await writeFile(join(created.path, 'secret.env'), 'TOKEN=super-secret\n');
+	await writeFile(join(created.path, 'app.txt'), 'a real edit\n');
+
+	const result = await ws.deliver(root, created, { cleanup: false });
+	assert.equal(result.ok, true);
+	assert.equal(result.preCommitted, true, 'the real edit is committed');
+
+	const tracked = (await git(root, ['ls-files'])).stdout.split(/\r?\n/).filter((line) => line !== '');
+	assert.equal(tracked.includes('app.txt'), true);
+	// The ignore rules that keep a build directory out of a repository are the rules
+	// that keep a secret out of it, and a commit cannot be taken back by a click.
+	assert.equal(tracked.includes('secret.env'), false, 'an ignored secret is not written into the base branch');
+	assert.equal(tracked.some((name) => name.startsWith('build/')), false, 'nor an ignored artifact');
+});
+
+test('commitIgnoredArtifacts is the opt-in that keeps an ignored artifact', async () => {
+	const { root } = await repo({ name: 'ignored-optin' });
+	const created = await ws.create(root);
+	const { mkdir } = await import('node:fs/promises');
+	await mkdir(join(created.path, 'build'), { recursive: true });
+	await writeFile(join(created.path, '.gitignore'), 'build/\n');
+	await writeFile(join(created.path, 'build/out.bin'), 'artifact\n');
+	await writeFile(join(created.path, 'app.txt'), 'a real edit\n');
+
+	const result = await ws.deliver(root, created, { cleanup: false, commitIgnored: true });
+	assert.equal(result.ok, true);
+	const tracked = (await git(root, ['ls-files'])).stdout;
+	assert.match(tracked, /build\/out\.bin/, 'the configured opt-in keeps the artifact when the worktree goes away');
 });
 
 /* ----------------------------------------------------------------- commit -- */
@@ -291,18 +331,31 @@ test('commit refuses a clean tree instead of making an empty commit', async () =
 	assert.equal(await oid(created.path), before, 'nothing was written');
 });
 
-test('commit keeps ignored artifacts, exactly as the automatic checkpoint does', async () => {
+test('commit honours the ignore rules by default, and forces past them only when asked', async () => {
 	const { root } = await repo({ name: 'commit-ignored' });
 	const created = await ws.create(root);
 	const { mkdir } = await import('node:fs/promises');
 	await mkdir(join(created.path, 'build'), { recursive: true });
 	await writeFile(join(created.path, '.gitignore'), 'build/\n');
 	await writeFile(join(created.path, 'build/out.bin'), 'artifact\n');
+	await writeFile(join(created.path, 'app.txt'), 'a real edit\n');
 
-	const result = await ws.commit(created.path);
-	assert.equal(result.ok, true);
-	const tracked = await git(created.path, ['ls-files']);
-	assert.match(tracked.stdout, /build\/out\.bin/, 'the artifact is committed with --force, as delivery does');
+	// Default: the ignore rules belong to the user, so the button honours them.
+	const byDefault = await ws.commit(created.path);
+	assert.equal(byDefault.ok, true);
+	let tracked = await git(created.path, ['ls-files']);
+	assert.equal(/build\/out\.bin/.test(tracked.stdout), false, 'an ignored path is left out of the commit');
+	assert.match(tracked.stdout, /app\.txt/, 'the real edit is still committed');
+
+	// Opt-in: the SAME button, told to take ignored paths as well. Note the real edit
+	// is what makes the tree dirty at all — ignored paths alone never count, which is
+	// why this option can only ever widen an existing commit.
+	await writeFile(join(created.path, 'app.txt'), 'another real edit\n');
+	await writeFile(join(created.path, 'build/out.bin'), 'artifact v2\n');
+	const forced = await ws.commit(created.path, { commitIgnored: true });
+	assert.equal(forced.ok, true);
+	tracked = await git(created.path, ['ls-files']);
+	assert.match(tracked.stdout, /build\/out\.bin/, 'the opt-in commits the artifact');
 });
 
 test('deliver refuses a dirty main tree and touches nothing', async () => {
