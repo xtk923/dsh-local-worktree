@@ -19,13 +19,55 @@ merge, nothing more.
 ```
 
 The worktree lands **under the repository** by default (`worktreeLayout: inside`),
-which is what lets the DSH sidebar nest it inside the repository's own workspace
-group — the sidebar nests a workspace under its nearest *registered* ancestor
-directory, so a sibling directory could never appear there. The container is
-`.dsh-worktrees/`, and the plugin adds that one line to the repository's own
-`.git/info/exclude` before creating it, so the main tree's `git status` never sees
-it and a `git add -A` there cannot commit a parallel checkout. Set
-`worktreeLayout: sibling` for the older `<parent>\<repo>_worktrees\` layout.
+and its sessions are shown **in the repository's own group** in the DSH sidebar —
+a worktree is a second place to work on the same project, not a second project.
+The container is `.dsh-worktrees/`, and the plugin adds that one line to the
+repository's own `.git/info/exclude` before creating it, so the main tree's `git
+status` never sees it and a `git add -A` there cannot commit a parallel checkout.
+Set `worktreeLayout: sibling` for the older `<parent>\<repo>_worktrees\` layout —
+the sessions are still shown in the repository's group.
+
+## Sidebar: the worktree's session belongs to the repository
+
+Where the sidebar puts a session is the Host's decision and it is not configurable:
+`Workspace.sessionIds` is filtered by `cwd === workspace.path`, and `attachSession`
+refuses a session whose `cwd` differs from the workspace path. A session running in
+a worktree can therefore only ever belong to the worktree's own Workspace, and the
+Workspace Tree nests that Workspace under the repository's — which is how every new
+worktree used to add a workspace row under the main one, with its session inside.
+
+No sidebar setting changes that membership, so the merge is done in the one seam a
+plugin *can* own: the Workspace projection every Workspace surface renders from
+(`ctx.workspaces.list`). Its `getSnapshot` is wrapped, and the projection the
+sidebar draws is derived from the Host's own:
+
+* a registered worktree Workspace stops being a group of its own, and its sessions
+  join the group of the repository they were cut from;
+* a Session that RUNS in a worktree but belongs to no Workspace at all — the
+  `git_worktree` tool's, `/worktree`'s, or the Host fallback's, all of which the
+  Host leaves under **Ungrouped** — is adopted by that same group, found by its
+  live `cwd`;
+* a worktree of a worktree resolves to the outermost group, and anything that is
+  not this plugin's worktree is left exactly as it was: DSH's own managed checkouts
+  under `$DSH_HOME/worktrees/`, a directory that merely *looks* like a container,
+  and every ordinary Workspace.
+
+The rule is a name rule, applied positionally: the first segment below the
+repository must be `.dsh-worktrees` (this plugin's inside layout) or a
+`*_worktrees` directory (its sibling layout). Membership is never guessed from a
+substring, because a merge that swallowed too much would hide a real Workspace.
+
+**Nothing on the Host moves.** Working directories, session logs, Workspace
+attachments and the plugin's own registry are untouched; only what the sidebar
+draws is derived differently. That is what makes the browser-local switch a real
+one — `localStorage['dsh.dsh-local-worktree.sidebar-merge'] = 'off'` restores the
+per-worktree groups exactly as they were, with no restart and no Host change.
+
+Because the sidebar's picker and its **New session** button read the same merged
+projection, a worktree no longer appears there as a place to start a session:
+worktree sessions are started from this plugin's own control. The group's **New
+session** button creates a session in the repository, which is what its group
+means.
 
 Every click mints a **new** `app_<timestamp+random>` directory, so two clicks are
 two worktrees rather than one reused one.
@@ -90,14 +132,21 @@ Joining a new worktree is **two client calls, in this order**, and both are the
 calls the sidebar makes for itself:
 
 1. `workspaces.create({ path })` — registers the new directory as a DSH
-   Workspace. This is what puts it in the sidebar at all, and it is what makes the
-   session group *under* the worktree instead of landing in **Ungrouped**; the
-   call is idempotent (the Host resolves by canonical path first) and its answer is
-   merged into the client's own projection immediately, so the row exists before
-   anything tries to navigate to it.
-2. `uiWorkspace.openWorkspace(id)` — the sidebar's **New session** button, exactly:
-   it starts a blank session whose working directory is that workspace and selects
-   it.
+   Workspace. This is what attaches its session to that directory instead of
+   leaving it in **Ungrouped**, and it is what the Host's own registry records;
+   the call is idempotent (the Host resolves by canonical path first) and its
+   answer is merged into the client's own projection immediately.
+2. `sessions.create({ workspaceId })` — creates the blank Session rooted in that
+   worktree and attached to its Workspace, which the client can address at once —
+   and then `uiWorkspace.openSession(id)` selects it.
+
+The second call is deliberately **not** `uiWorkspace.openWorkspace(id)`. That
+shipped call resolves its Workspace out of the very projection the sidebar merge
+rewrites, and the worktree's own row is absent from it by then, so it would fail
+with `unknown workspace` *after* the directory was created. `sessions.create` has
+the property the old order existed to guarantee — the Session is catalogued
+before the call resolves, so navigating to it cannot race the session list the way
+a Host-created one does.
 
 The order is not an implementation detail; it is the reason the jump used to do
 nothing. A session started on the **Host** is unknown to the browser until a later
@@ -105,6 +154,10 @@ list refresh, and `sessions.retain()` — the call navigation makes — throws
 `unknown session` for an id the client has never seen, so navigating to one
 immediately after creating it silently fails. A session the **client** creates is
 addressable the moment that call resolves.
+
+Without the merge (a browser that switched it off, or a composition with no
+Session projection) the shipped `openWorkspace` call is still the one used, so an
+older page keeps working unchanged.
 
 If a composition has no `workspaces`/`sessions` service, the control degrades
 instead of breaking: it asks the Host (`POST /session`) to start the session the
@@ -257,7 +310,7 @@ is discovered automatically from the package's `dsh.client` section.
 | `commitMessage` | `wip: dsh worktree checkpoint` | Prefix of the generated subject, used by both the button and the automatic checkpoint. |
 | `commitIgnoredArtifacts` | `false` | Stage paths `.gitignore` excludes in a checkpoint commit, so an ignored build artifact survives the worktree being removed. Off by default: those same paths are where secrets live, and a commit cannot be taken back. It can only ever widen a commit that was happening anyway — an ignored path on its own never counts as dirty. |
 | `registerTool` | `true` | Expose the `git_worktree` tool to the agent. |
-| `worktreeLayout` | `inside` | Where a worktree lands: `inside` = `<repo>\.dsh-worktrees\<repo>_<id>` (nests under the repository in the sidebar's Workspace Tree grouping, and the container is added to `.git/info/exclude`); `sibling` = `<parent>\<repo>_worktrees\<repo>_<id>`. |
+| `worktreeLayout` | `inside` | Where a worktree lands: `inside` = `<repo>\.dsh-worktrees\<repo>_<id>` (the container is added to `.git/info/exclude`); `sibling` = `<parent>\<repo>_worktrees\<repo>_<id>`. Both are recognised by the sidebar merge, so the layout is a filesystem choice only. |
 | `gitTimeoutMs` | `60000` | Wall-clock budget for one git command. |
 | `registryPath` | `$DSH_HOME/plugins/dsh-local-worktree/worktrees.json` | Where created worktrees are remembered. |
 
@@ -319,12 +372,9 @@ the real list and asserts the popover keeps an opaque fallback.
 Two layouts, one decision — `worktreeLayout`:
 
 * **`inside` (default)** — `<repo>\.dsh-worktrees\<repo>_<id>`. The worktree sits
-  under the repository, which is the only way it can appear inside the
-  repository's own group in the sidebar: the sidebar nests a workspace under its
-  nearest *registered ancestor directory*, so a sibling directory is always a
-  parallel group however it is registered (and in the flat/WorkSpace grouping
-  modes the two are always siblings — that view mode is a browser-local setting
-  this plugin cannot and should not change).
+  under the repository, which keeps a repository's worktrees together on disk and
+  inside the repository's own folder — and it is the layout the sidebar merge
+  recognises ([above](#sidebar-the-worktrees-session-belongs-to-the-repository)).
   Because the container is inside the working tree, the plugin adds
   `.dsh-worktrees/` to the repository's `.git/info/exclude` **before** creating
   it. `info/exclude` and not `.gitignore`: the line stays local to your clone, so
@@ -376,7 +426,7 @@ node --test "test/**/*.test.mjs"
 the suite is named by glob; it also keeps `test/fixture.mjs`, a helper rather than
 a suite, out of the run.)
 
-141 tests. The repository and operation suites run **real git** in throwaway
+151 tests. The repository and operation suites run **real git** in throwaway
 repositories under the OS temp directory — no mocked child process — and the
 implementation suite drives the actual HTTP route handlers with synthetic
 requests. The assertions are about the promises above: a fast-forward stays
@@ -400,4 +450,12 @@ asks *before* it merges, that the default answer is the one that removes the
 worktree (first, marked, focused), and that choosing to keep sends
 `cleanup: false` — and the clock the row reads: moving the session's own store (a
 turn ending, a recorded prompt) re-reads git state, while a re-render that
-carries no movement reads nothing.
+carries no movement reads nothing. The sidebar merge is asserted as a projection:
+a worktree's sessions join the repository's group and its own group is gone, a
+worktree of a worktree lands in the outermost group, a Session the Host left
+ungrouped is adopted by its `cwd`, a directory that merely looks like a container
+is left alone, the merged snapshot stays one stable object per change (React's
+`useSyncExternalStore` contract), the browser switch and a missing Session
+projection each leave the Host's own projection untouched, the create flow starts
+its Session through the Session Controller rather than `openWorkspace`, and a
+worktree whose group was merged away is still reached by where its session runs.

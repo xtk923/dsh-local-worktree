@@ -37,13 +37,35 @@
  * session's own clock (`turnRunning`, `activity` below): the turn boundary is what
  * re-reads git state, not a click and not a timer.
  *
- * Navigation is the two calls the sidebar makes for ITSELF, in this order:
+ * Navigation is two calls the browser owns, in this order:
  * `workspaces.create({ path })` registers the new worktree directory as a DSH
- * Workspace — which is what puts it in the sidebar at all, and what makes its
- * session group under it instead of landing in "Ungrouped" — and then
- * `uiWorkspace.openWorkspace(id)` starts a blank session whose working directory
- * is that workspace and selects it, which is exactly the sidebar's own "New
- * session" button.
+ * Workspace, which is what attaches its session to that directory instead of
+ * leaving it in "Ungrouped" — how that Workspace is *displayed* is the sidebar
+ * merge's business, below — and then the session is created **through the Session
+ * Controller** and selected. That second half is `sessions.create({ workspaceId })`
+ * + `openSession`, not `openWorkspace`: see {@link openWorktreeSession}, and the
+ * sidebar merge below, which is the reason.
+ *
+ * ## The sidebar merge, and why it exists
+ *
+ * A worktree is a second PLACE to work on the SAME project, so the sidebar's
+ * per-worktree Workspace row was never wanted: the user's report was "every new
+ * worktree adds a workspace under the main one, and its session sits in there".
+ * Where that row comes from is the Host: `Workspace.sessionIds` is filtered by
+ * `cwd === workspace.path`, and `attachSession` refuses a session whose `cwd`
+ * differs from the workspace path — so a session running in the worktree can only
+ * ever belong to the worktree's own Workspace. No sidebar setting changes that
+ * membership, and the tree nests a registered Workspace under its nearest
+ * registered ancestor directory, which is why a worktree INSIDE the repository
+ * renders as a child group of it.
+ *
+ * So the merge is done where a plugin is allowed to do it: the ONE Workspace
+ * projection every Workspace surface renders from is wrapped, worktree rows are
+ * folded into the repository's group, and ungrouped worktree sessions are adopted
+ * by it. Nothing on the Host moves — working directories, session logs, Workspace
+ * attachments and the plugin's own registry are untouched — which is what makes
+ * the switch ({@link sidebarMergeEnabled}) a pure display change, and what makes
+ * the merge survive a reload for sessions this plugin did not start.
  *
  * The order is not a shortcut around the Host; it is the only one that works. A
  * session started ON the Host is unknown to this client until a later list
@@ -75,13 +97,14 @@ window.__ModuleLoader__.load({
 		/**
 		 * The client services this control needs, captured in `apply`.
 		 *
-		 * `workspaces` registers the new directory as a DSH Workspace — which is
-		 * what puts it in the sidebar at all, and what makes its session group
-		 * under it instead of landing in "Ungrouped" — `sessions` is not used
-		 * directly here (it is what `uiWorkspace.openWorkspace` calls), and
-		 * `uiWorkspace` is the navigation surface.
+		 * `workspaces` registers the new directory as a DSH Workspace, which is
+		 * what attaches its session to that directory instead of leaving it in
+		 * "Ungrouped" — `sessions` creates that Session and answers where a
+		 * worktree's session is, `uiWorkspace` is the navigation surface, and
+		 * `sidebarMerge` records whether the projection rewrite (see below) is
+		 * installed, which decides how the Session is opened.
 		 */
-		const services = { uiWorkspace: null, workspaces: null };
+		const services = { uiWorkspace: null, workspaces: null, sessions: null, sidebarMerge: false };
 
 		/**
 		 * Show a Session in the Conversation panel.
@@ -116,6 +139,336 @@ window.__ModuleLoader__.load({
 		function sameDir(left, right) {
 			const norm = (value) => String(value ?? '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 			return norm(left) !== '' && norm(left) === norm(right);
+		}
+
+		/* -------------------------------------------------- sidebar grouping -- */
+
+		/**
+		 * Where this plugin puts worktrees, as directory names.
+		 *
+		 * The two layouts it can produce — `<repo>\.dsh-worktrees\<name>` and
+		 * `<parent>\<repo>_worktrees\<name>` — are the ENTIRE rule for which
+		 * directories the sidebar merge touches. It is deliberately a name rule and
+		 * not "any directory under the repository": DSH's own managed checkouts
+		 * (`$DSH_HOME/worktrees/…`) and a worktree you made by hand are none of this
+		 * plugin's business, and must keep whatever row the sidebar gives them.
+		 */
+		const WORKTREE_CONTAINERS = new Set(['.dsh-worktrees']);
+		const WORKTREE_CONTAINER_SUFFIX = '_worktrees';
+
+		/**
+		 * Where the sidebar merge can be switched off, in the browser.
+		 *
+		 * A page-local switch and not a Host option on purpose: this is a display
+		 * decision taken entirely in the browser, so it costs no restart, and the
+		 * value lives beside the other browser-local view state the sidebar keeps.
+		 */
+		const SIDEBAR_MERGE_KEY = 'dsh.dsh-local-worktree.sidebar-merge';
+
+		/**
+		 * Whether the sidebar merge is on.
+		 *
+		 * ON by default — the user asked for the worktree's session to sit in the
+		 * repository's own group — and `localStorage['dsh.dsh-local-worktree.sidebar-merge'] = 'off'`
+		 * restores the per-worktree groups exactly as they were.
+		 */
+		function sidebarMergeEnabled() {
+			try {
+				return String(window.localStorage.getItem(SIDEBAR_MERGE_KEY) ?? '').toLowerCase() !== 'off';
+			} catch {
+				// No storage (a sandboxed page, a test harness): the default stands.
+				return true;
+			}
+		}
+
+		/** A directory path as comparable segments: separators unified, case folded. */
+		function segmentsOf(value) {
+			return String(value ?? '')
+				.replace(/\\/g, '/')
+				.split('/')
+				.map((part) => part.trim().toLowerCase())
+				.filter((part) => part !== '');
+		}
+
+		/** Whether `ancestor` is a PROPER ancestor directory of `descendant`. */
+		function isAncestorPath(ancestor, descendant) {
+			const from = segmentsOf(ancestor);
+			const to = segmentsOf(descendant);
+			if (from.length === 0 || to.length <= from.length) return false;
+			for (let index = 0; index < from.length; index += 1) {
+				if (to[index] !== from[index]) return false;
+			}
+			return true;
+		}
+
+		/** The directory name this plugin's worktrees live under, or null. */
+		function worktreeContainerName(segment) {
+			if (typeof segment !== 'string' || segment === '') return null;
+			const name = segment.toLowerCase();
+			if (WORKTREE_CONTAINERS.has(name)) return name;
+			if (name.endsWith(WORKTREE_CONTAINER_SUFFIX) && name.length > WORKTREE_CONTAINER_SUFFIX.length) return name;
+			return null;
+		}
+
+		/**
+		 * Whether `directory` is a worktree THIS plugin cut inside `owner`'s tree.
+		 *
+		 * The test is positional, not a substring search: the first segment below
+		 * `owner` must be a container name, and something must live under it. A
+		 * directory merely NAMED like a container somewhere deeper is not a worktree
+		 * this plugin made, and a plain subdirectory of the repository is not either
+		 * — which matters, because the merge moves rows and dropping a real
+		 * workspace row would lose the only way back to its sessions.
+		 */
+		function worktreeInside(owner, directory) {
+			if (!isAncestorPath(owner, directory)) return false;
+			const depth = segmentsOf(owner).length;
+			const below = segmentsOf(directory);
+			return worktreeContainerName(below[depth]) !== null;
+		}
+
+		/**
+		 * The registered Workspace whose directory owns `directory`.
+		 *
+		 * The NEAREST one, i.e. the longest registered path above it: that is the
+		 * same rule the sidebar's own Workspace Tree nests groups by, so a merged
+		 * row lands in the group the user is already looking at. Null when no
+		 * registered Workspace is above the directory at all — in which case nothing
+		 * is merged, because there would be no group to merge into.
+		 */
+		function owningWorkspace(directory, items) {
+			let owner = null;
+			let depth = -1;
+			for (const item of items) {
+				if (item === null || typeof item !== 'object' || typeof item.path !== 'string') continue;
+				if (!isAncestorPath(item.path, directory)) continue;
+				const candidate = segmentsOf(item.path).length;
+				if (candidate > depth) {
+					owner = item;
+					depth = candidate;
+				}
+			}
+			return owner;
+		}
+
+		/** The same list without repeats, keeping the first occurrence's position. */
+		function distinctIds(ids) {
+			const seen = new Set();
+			const out = [];
+			for (const id of ids) {
+				if (typeof id !== 'string' || id === '' || seen.has(id)) continue;
+				seen.add(id);
+				out.push(id);
+			}
+			return out;
+		}
+
+		/**
+		 * Sessions that RUN inside one of this plugin's worktrees but belong to no
+		 * Workspace at all.
+		 *
+		 * The Host groups by `cwd === workspace.path` and attaches a Session only
+		 * when it is created THROUGH a Workspace, so a Session started with a bare
+		 * `cwd` — the `git_worktree` tool, `/worktree`, or the Host fallback this
+		 * plugin still keeps — is ungrouped there and would appear under
+		 * **Ungrouped** while its directory plainly belongs to the repository. Its
+		 * live `cwd` is the whole rule, so it is read from the Session projection,
+		 * never remembered from a click.
+		 */
+		function ungroupedWorktreeSessions(items, sessions) {
+			const adopt = new Map();
+			const byId = sessions !== null && typeof sessions === 'object' && sessions.byId !== null && typeof sessions.byId === 'object'
+				? sessions.byId
+				: null;
+			if (byId === null) return adopt;
+			const accounted = new Set();
+			for (const item of items) {
+				for (const id of Array.isArray(item.sessionIds) ? item.sessionIds : []) accounted.add(id);
+			}
+			for (const [id, summary] of Object.entries(byId)) {
+				if (accounted.has(id) || summary === null || typeof summary !== 'object') continue;
+				if (typeof summary.cwd !== 'string' || summary.cwd === '') continue;
+				const owner = owningWorkspace(summary.cwd, items);
+				if (owner === null || !worktreeInside(owner.path, summary.cwd)) continue;
+				adopt.set(owner.workspaceId, [...(adopt.get(owner.workspaceId) ?? []), id]);
+			}
+			return adopt;
+		}
+
+		/**
+		 * The sidebar projection: this plugin's worktrees folded into the repository.
+		 *
+		 * What it changes, and what it deliberately does not:
+		 *
+		 *   * a registered worktree Workspace stops being a group of its own and its
+		 *     sessions join the group of the repository they were cut from — the user
+		 *     asked for exactly that, because a worktree is a place the SAME project
+		 *     is worked on, not a second project;
+		 *   * a Session that runs in a worktree but belongs to no Workspace is adopted
+		 *     by that same group, so the row is in the one place a reader looks;
+		 *   * nothing else moves. A worktree that is not this plugin's, a directory
+		 *     that only looks like a container, a Session whose `cwd` is another
+		 *     plugin's business — all keep the rows the sidebar gave them.
+		 *
+		 * This is a DISPLAY transform of one projection. The Host registry, the
+		 * Sessions' working directories, their logs and their Workspace attachments
+		 * are untouched, which is why switching the merge off restores the previous
+		 * sidebar exactly (see {@link sidebarMergeEnabled}).
+		 */
+		function mergeWorktreeGroups(snapshot, sessions) {
+			const items = snapshot !== null && typeof snapshot === 'object' && Array.isArray(snapshot.items) ? snapshot.items : null;
+			if (items === null || items.length === 0) return snapshot;
+
+			// Which worktree Workspace is displayed under which repository. A worktree
+			// of a worktree — which this plugin does not create, but which costs three
+			// lines to survive — resolves to the outermost group rather than to a group
+			// that is itself about to disappear.
+			const parentOf = new Map();
+			for (const item of items) {
+				if (item === null || typeof item !== 'object') continue;
+				const owner = owningWorkspace(item.path, items);
+				parentOf.set(item.workspaceId, owner === null ? null : (worktreeInside(owner.path, item.path) ? owner.workspaceId : null));
+			}
+			const outermost = (workspaceId) => {
+				const seen = new Set([workspaceId]);
+				let current = workspaceId;
+				for (;;) {
+					const parent = parentOf.get(current);
+					if (parent === null || parent === undefined || seen.has(parent)) return current;
+					seen.add(parent);
+					current = parent;
+				}
+			};
+
+			const dropped = new Set();
+			const absorbed = new Map();
+			for (const item of items) {
+				if (item === null || typeof item !== 'object') continue;
+				if (parentOf.get(item.workspaceId) === null || parentOf.get(item.workspaceId) === undefined) continue;
+				const target = outermost(item.workspaceId);
+				if (target === item.workspaceId) continue;
+				dropped.add(item.workspaceId);
+				absorbed.set(target, [...(absorbed.get(target) ?? []), ...(Array.isArray(item.sessionIds) ? item.sessionIds : [])]);
+			}
+
+			const adopted = ungroupedWorktreeSessions(items, sessions);
+			if (dropped.size === 0 && adopted.size === 0) return snapshot;
+
+			/**
+			 * How recently a Session moved, as the sidebar's own clock reads it.
+			 *
+			 * The borrowed rows are ordered by this rather than by HOW they got here:
+			 * whether a worktree's Session was accounted by its Workspace or left
+			 * ungrouped by the Host is an implementation difference, and letting it
+			 * decide the order would put the same directory's Sessions in two
+			 * different orders in two different states.
+			 */
+			const recency = (sessionId) => {
+				const summary = sessions !== null && typeof sessions === 'object' && sessions.byId !== null && typeof sessions.byId === 'object'
+					? sessions.byId[sessionId]
+					: undefined;
+				const updatedAt = summary === null || summary === undefined ? Number.NaN : Number(summary.updatedAt);
+				return Number.isFinite(updatedAt) ? updatedAt : 0;
+			};
+
+			const merged = [];
+			for (const item of items) {
+				if (item === null || typeof item !== 'object') continue;
+				if (dropped.has(item.workspaceId)) continue;
+				// The worktree's sessions lead the repository's own, newest first, which
+				// is both the order a nested child group used to read in and the order
+				// the sidebar's default ordering would derive anyway.
+				const borrowed = [...(absorbed.get(item.workspaceId) ?? []), ...(adopted.get(item.workspaceId) ?? [])]
+					.sort((left, right) => recency(right) - recency(left));
+				if (borrowed.length === 0) {
+					merged.push(item);
+					continue;
+				}
+				merged.push({
+					...item,
+					sessionIds: distinctIds([...borrowed, ...(Array.isArray(item.sessionIds) ? item.sessionIds : [])])
+				});
+			}
+			return { ...snapshot, items: merged };
+		}
+
+		/**
+		 * Install the sidebar merge on the Client's Workspace projection.
+		 *
+		 * The rewrite happens on the ONE snapshot source every Workspace surface
+		 * reads (`ctx.workspaces.list`), because that object IS the `useWorkspaces`
+		 * hook the sidebar renders from — a plugin has no seat inside the sidebar
+		 * body to re-group rows in, and this is the seam that exists.
+		 *
+		 * Two details this depends on, both verified against the shipped packages:
+		 * the source hands out a STABLE object per change (so the wrapper must too,
+		 * or React re-renders forever), and its own `flush`/`refreshSnapshot` never
+		 * call `getSnapshot` (so shadowing the prototype method on this instance
+		 * cannot recurse).
+		 *
+		 * It requires BOTH projections: the merge reads Session `cwd`s to adopt
+		 * ungrouped worktree Sessions. Without a Session projection the merge is not
+		 * installed at all, which keeps `openWorkspace` — the older way this plugin
+		 * started a worktree Session, and one that resolves the Workspace out of this
+		 * very projection — working for a composition that lacks one.
+		 */
+		function installSidebarMerge(services) {
+			const model = services.workspaces === null || services.workspaces === undefined ? null : services.workspaces.list;
+			if (model === null || model === undefined || typeof model.getSnapshot !== 'function') return false;
+			if (model.__dshLocalWorktreeMerge === true) return true;
+			if (sidebarMergeEnabled() !== true) return false;
+			const sessions = services.sessions === null || services.sessions === undefined ? null : services.sessions.list;
+			if (sessions === null || sessions === undefined || typeof sessions.getSnapshot !== 'function') return false;
+
+			const readWorkspaces = model.getSnapshot;
+			const readSessions = sessions.getSnapshot;
+			let seenWorkspaces = null;
+			let seenSessions = null;
+			let merged = null;
+
+			model.getSnapshot = function getSnapshotWithWorktreesMerged() {
+				const snapshot = readWorkspaces.call(this);
+				const sessionSnapshot = readSessions.call(sessions);
+				// Keyed on BOTH sources: a Session appearing, ending or changing
+				// directory can move a row between groups without any Workspace event.
+				if (snapshot !== seenWorkspaces || sessionSnapshot !== seenSessions) {
+					seenWorkspaces = snapshot;
+					seenSessions = sessionSnapshot;
+					merged = mergeWorktreeGroups(snapshot, sessionSnapshot);
+				}
+				return merged;
+			};
+			Object.defineProperty(model, '__dshLocalWorktreeMerge', { value: true, configurable: true });
+			return true;
+		}
+
+		/**
+		 * The most recently touched Session whose working directory IS `path`.
+		 *
+		 * Read live from the Session projection, never remembered from a click: this
+		 * is what lets the control still jump to a worktree whose Workspace row the
+		 * sidebar merge folded away, and it keeps working for a worktree this browser
+		 * never created (the `git_worktree` tool's, or one made before the page was
+		 * reloaded) — where the plugin's own record has no session id at all.
+		 */
+		function sessionInDirectory(path) {
+			if (typeof path !== 'string' || path === '') return null;
+			const sessions = services.sessions;
+			const byId = sessions !== null && sessions.list && typeof sessions.list.getSnapshot === 'function'
+				? sessions.list.getSnapshot().byId
+				: null;
+			if (byId === null || typeof byId !== 'object') return null;
+			let found = null;
+			let newest = -1;
+			for (const [id, summary] of Object.entries(byId)) {
+				if (summary === null || typeof summary !== 'object' || !sameDir(summary.cwd, path)) continue;
+				const at = Number(summary.updatedAt) || 0;
+				if (at >= newest) {
+					found = id;
+					newest = at;
+				}
+			}
+			return found;
 		}
 
 		/**
@@ -154,12 +507,42 @@ window.__ModuleLoader__.load({
 			const workspaceId = workspace && typeof workspace.workspaceId === 'string' ? workspace.workspaceId : '';
 			if (workspaceId === '') return { ok: false, stage: 'create-failed' };
 			try {
-				await navigation.openWorkspace(workspaceId);
+				await openWorktreeSession(workspaceId, navigation);
 			} catch (error) {
 				console.warn('dsh-local-worktree: the workspace is registered but its session was not opened:', error);
 				return { ok: false, stage: 'navigate-failed', workspaceId };
 			}
 			return { ok: true, stage: 'done', workspaceId };
+		}
+
+		/**
+		 * Start the worktree's Session and show it.
+		 *
+		 * With the sidebar merge installed this is `sessions.create({ workspaceId })`
+		 * followed by `openSession`, and NOT `openWorkspace`. The difference is not
+		 * cosmetic: `openWorkspace` resolves its Workspace out of the projection the
+		 * merge rewrites, and the worktree's own row is deliberately absent from it —
+		 * so that call would now fail with `unknown workspace` AFTER the directory was
+		 * created. `sessions.create` creates the very same Session — rooted in the
+		 * worktree path, attached to its Workspace on the Host — and publishes its
+		 * catalog row before it resolves, which is the one property the two-call order
+		 * existed to guarantee (a client-created Session is addressable at once).
+		 *
+		 * Without the merge — an older page, storage switched off, a composition with
+		 * no Session projection — the shipped `openWorkspace` call is kept verbatim,
+		 * because it is still exactly what the sidebar's own "New session" does.
+		 */
+		async function openWorktreeSession(workspaceId, navigation) {
+			const sessions = services.sessions;
+			if (services.sidebarMerge === true && sessions !== null && typeof sessions.create === 'function') {
+				const sessionId = await sessions.create({ workspaceId });
+				if (typeof sessionId === 'string' && sessionId !== '') {
+					navigation.openSession(sessionId);
+					return sessionId;
+				}
+			}
+			await navigation.openWorkspace(workspaceId);
+			return null;
 		}
 
 		/**
@@ -669,6 +1052,17 @@ window.__ModuleLoader__.load({
 			 * projection is also the authority the sidebar groups by, so its answer is
 			 * the one that is certain to be a row the user can actually see.
 			 */
+			/**
+			 * The session working in one of this plugin's other worktrees.
+			 *
+			 * Answered BY DIRECTORY, in this order. The browser's Workspace projection
+			 * goes first — a session the browser started is registered there at once,
+			 * and that projection is the authority the sidebar groups by — and then the
+			 * Session projection answers by `cwd`, which is what still finds the session
+			 * once the sidebar merge has folded the worktree's own Workspace row away.
+			 * The Host's remembered id is the last resort: it only exists once the Host
+			 * has been told about the session.
+			 */
 			const sessionOfWorktree = React.useCallback((record) => {
 				const workspaces = services.workspaces;
 				const items = workspaces !== null && workspaces.list && typeof workspaces.list.getSnapshot === 'function'
@@ -679,6 +1073,8 @@ window.__ModuleLoader__.load({
 					const first = match !== undefined && Array.isArray(match.sessionIds) ? match.sessionIds[0] : undefined;
 					if (typeof first === 'string' && first !== '') return first;
 				}
+				const byDirectory = sessionInDirectory(record.path);
+				if (byDirectory !== null) return byDirectory;
 				return typeof record.sessionId === 'string' && record.sessionId !== '' ? record.sessionId : null;
 			}, []);
 
@@ -980,6 +1376,13 @@ window.__ModuleLoader__.load({
 				// the navigation, never the control.
 				services.uiWorkspace = ctx.uiWorkspace ?? ctx.get?.('uiWorkspace') ?? null;
 				services.workspaces = ctx.workspaces ?? ctx.get?.('workspaces') ?? null;
+				services.sessions = ctx.sessions ?? ctx.get?.('sessions') ?? null;
+				// The sidebar merge is installed here rather than in the component, because
+				// it rewrites a projection the page renders from: it must be in place before
+				// the sidebar draws, and it must not depend on this control being mounted.
+				// `false` — no Workspace projection, no Session projection, or the browser
+				// switched it off — leaves every shipped surface exactly as it was.
+				services.sidebarMerge = installSidebarMerge(services);
 				// ONE seat, deliberately. `conversation.input.left` is the composer
 				// toolbar: ambient, so it exists before the first message, and present in
 				// every session. Registering a second seat is what put two copies of this

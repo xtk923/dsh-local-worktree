@@ -59,12 +59,18 @@ const THEME_TOKENS = new Set([
  * routes the control calls. They must go into the sandbox's own global: the
  * bundle runs in a separate V8 context, so the test file's `globalThis` is not
  * what its code sees.
+ *
+ * `windowExtra` adds to the page's `window` itself — `localStorage`, which the
+ * sidebar merge reads to decide whether it is on. It is separate from `extra`
+ * because `window` is a global the harness already owns: a test supplies the
+ * members it cares about, rather than a whole replacement that would have to
+ * carry the module loader again.
  */
-function loadDefinition(extra = {}) {
+function loadDefinition(extra = {}, windowExtra = {}) {
 	new Script(SOURCE, { filename: CLIENT_PATH });
 	let registered = null;
 	const sandbox = {
-		window: { __ModuleLoader__: { load: (definition) => { registered = definition; } } },
+		window: { __ModuleLoader__: { load: (definition) => { registered = definition; } }, ...windowExtra },
 		console,
 		...extra
 	};
@@ -333,7 +339,7 @@ function stubFetch(routes, calls) {
 }
 
 /** Mount the control with the services and route answers a Web page would give it. */
-async function mountControl({ services = {}, cwd = undefined, session = {}, routes = null } = {}) {
+async function mountControl({ services = {}, cwd = undefined, session = {}, routes = null, window: windowExtra = {} } = {}) {
 	const calls = [];
 	// Filled in by the test once its route answers exist; the bundle's `fetch` reads
 	// through this, because it lives in its own VM context.
@@ -349,7 +355,7 @@ async function mountControl({ services = {}, cwd = undefined, session = {}, rout
 			if (fetcher.current === null) throw new Error(`unexpected fetch: ${url}`);
 			return fetcher.current(url, options);
 		}
-	});
+	}, windowExtra);
 	const { React, driver } = createReactStub();
 	const plugin = definition.factory((name) => {
 		if (name === 'react') return React;
@@ -899,4 +905,322 @@ test('a re-render that carries no session movement does not re-read git state', 
 	await harness.rerender();
 	await harness.rerender();
 	assert.equal(statusReads(harness), 1, 'one directory, one read, until something says it moved');
+});
+
+/* ------------------------------------------------------- the sidebar merge -- */
+
+/**
+ * A projection source shaped like `ctx.workspaces.list` and `ctx.sessions.list`:
+ * one stable object per change, subscribed to rather than polled.
+ */
+function projection(initial) {
+	let snapshot = initial;
+	return {
+		getSnapshot: () => snapshot,
+		subscribe: () => () => {},
+		/** Publish a replacement the way a model does: a NEW snapshot object. */
+		publish(next) {
+			snapshot = next;
+			return snapshot;
+		}
+	};
+}
+
+/** One Workspace row, as the Host projects it. */
+function workspaceRow(workspaceId, path, sessionIds = []) {
+	return {
+		workspaceId,
+		path,
+		title: path.replace(/\\/g, '/').split('/').pop(),
+		sessionIds,
+		createdAt: '2026-10-09T00:00:00.000Z',
+		updatedAt: '2026-10-09T00:00:00.000Z'
+	};
+}
+
+/** The Workspace projection's snapshot shape. */
+function workspaceProjection(items) {
+	return { items, archivedSessionIds: [], pinnedSessionIds: [], state: 'idle', phase: 'ready', error: null };
+}
+
+/** The Session projection's snapshot shape, keyed the way the sidebar keys it. */
+function sessionProjection(summaries) {
+	const byId = {};
+	for (const summary of summaries) byId[summary.id] = summary;
+	return { ids: summaries.map((summary) => summary.id), byId, phase: 'ready', projectionsBySession: {} };
+}
+
+const sessionRow = (id, cwd, updatedAt = 1) => ({ id, cwd, updatedAt });
+
+/**
+ * A sandbox-created value as this realm's own.
+ *
+ * The bundle runs in its own V8 context, so an array it builds carries that
+ * context's prototypes and `deepStrictEqual` — correctly — refuses to call it
+ * equal to one built here. Comparing the VALUES is the point; the realm they were
+ * built in is not.
+ */
+const plain = (value) => JSON.parse(JSON.stringify(value));
+
+/** Apply the bundle against the services a page provides, and hand them back. */
+function applyPlugin(services, windowExtra = {}) {
+	const definition = loadDefinition({}, windowExtra);
+	const plugin = definition.factory(() => ({ createElement: () => null, Fragment: 'Fragment' }));
+	plugin.apply({
+		uiWorkspace: services.uiWorkspace ?? null,
+		workspaces: services.workspaces ?? null,
+		sessions: services.sessions ?? null,
+		get: (name) => services[name] ?? undefined,
+		slots: { inject: (_key, callback) => callback(), register: () => () => {} }
+	});
+	return services;
+}
+
+/** The repository plus one worktree, as the Host reports both. */
+function repoAndWorktree() {
+	const workspaces = projection(workspaceProjection([
+		workspaceRow('ws-repo', REPO_PATH, ['session-repo']),
+		workspaceRow('ws-wt', WORKTREE_PATH, ['session-wt'])
+	]));
+	const sessions = projection(sessionProjection([
+		sessionRow('session-repo', REPO_PATH, 1),
+		sessionRow('session-wt', WORKTREE_PATH, 2)
+	]));
+	return { workspaces, sessions };
+}
+
+test('a worktree Workspace is folded into the repository group, and its own group is gone', () => {
+	// The membership rule is the Host's and cannot be argued with: a Session is
+	// accounted by the Workspace whose PATH equals its `cwd`, so a Session running
+	// in a worktree can only ever belong to the worktree's own Workspace — and the
+	// tree then nests that Workspace under the repository. The one seam left to a
+	// plugin is the projection every Workspace surface renders from.
+	const { workspaces, sessions } = repoAndWorktree();
+	applyPlugin({ workspaces: { list: workspaces }, sessions: { list: sessions } });
+
+	const merged = workspaces.getSnapshot();
+	assert.equal(merged.items.length, 1, 'the worktree is not a second Workspace in the sidebar');
+	assert.equal(merged.items[0].workspaceId, 'ws-repo');
+	assert.deepEqual(plain(merged.items[0].sessionIds), ['session-wt', 'session-repo'],
+		"the worktree's session sits in the repository group, where the child group used to be");
+	// Everything else about the row stays the Host's: only membership was rewritten.
+	assert.equal(merged.items[0].path, REPO_PATH);
+	assert.equal(merged.items[0].title, 'repo');
+	assert.equal(merged.phase, 'ready');
+});
+
+test('the merged projection is one stable object until a source changes', () => {
+	// React reads this through `useSyncExternalStore`: an object rebuilt on every
+	// read is a render loop, not a projection.
+	const { workspaces, sessions } = repoAndWorktree();
+	applyPlugin({ workspaces: { list: workspaces }, sessions: { list: sessions } });
+
+	const first = workspaces.getSnapshot();
+	assert.equal(workspaces.getSnapshot(), first, 'the same source snapshot maps to the same merged snapshot');
+
+	// A Session appears in the worktree: the row moves groups without any Workspace
+	// event, which is why the memo is keyed on BOTH projections.
+	sessions.publish(sessionProjection([
+		sessionRow('session-repo', REPO_PATH, 1),
+		sessionRow('session-wt', WORKTREE_PATH, 2),
+		sessionRow('session-wt-2', WORKTREE_PATH, 3)
+	]));
+	assert.notEqual(workspaces.getSnapshot(), first, 'Session movement alone produces a new merged snapshot');
+	assert.deepEqual(plain(workspaces.getSnapshot().items[0].sessionIds), ['session-wt-2', 'session-wt', 'session-repo']);
+});
+
+test('the browser can switch the merge off, and then the projection is untouched', () => {
+	const raw = workspaceProjection([
+		workspaceRow('ws-repo', REPO_PATH, ['session-repo']),
+		workspaceRow('ws-wt', WORKTREE_PATH, ['session-wt'])
+	]);
+	const workspaces = projection(raw);
+	const sessions = projection(sessionProjection([sessionRow('session-wt', WORKTREE_PATH, 1)]));
+	applyPlugin({ workspaces: { list: workspaces }, sessions: { list: sessions } }, { localStorage: { getItem: () => 'off' } });
+
+	assert.equal(workspaces.getSnapshot(), raw, "the Host's own projection is passed through, identity and all");
+});
+
+test('without a Session projection the merge is not installed at all', () => {
+	// `openWorkspace` — the older way this plugin started a worktree Session —
+	// resolves its Workspace out of this very projection. A composition that cannot
+	// answer where a Session runs must therefore be left alone, not half-merged.
+	const raw = workspaceProjection([
+		workspaceRow('ws-repo', REPO_PATH, ['session-repo']),
+		workspaceRow('ws-wt', WORKTREE_PATH, ['session-wt'])
+	]);
+	const workspaces = projection(raw);
+	applyPlugin({ workspaces: { list: workspaces } });
+
+	assert.equal(workspaces.getSnapshot(), raw);
+	assert.equal(Object.hasOwn(workspaces, '__dshLocalWorktreeMerge'), false, 'no wrapper was installed');
+});
+
+test('a worktree Session the Host left ungrouped is adopted by the repository group', () => {
+	// Sessions started with a bare `cwd` — the `git_worktree` tool, `/worktree`,
+	// the Host fallback — are attached to no Workspace at all, so the Host would
+	// show them under Ungrouped while their directory plainly belongs to the repo.
+	const workspaces = projection(workspaceProjection([workspaceRow('ws-repo', REPO_PATH, ['session-repo'])]));
+	const sessions = projection(sessionProjection([
+		sessionRow('session-repo', REPO_PATH, 1),
+		sessionRow('session-host-wt', WORKTREE_PATH, 2)
+	]));
+	applyPlugin({ workspaces: { list: workspaces }, sessions: { list: sessions } });
+
+	assert.deepEqual(plain(workspaces.getSnapshot().items[0].sessionIds), ['session-host-wt', 'session-repo']);
+});
+
+test('a Session elsewhere keeps whatever group the sidebar gives it', () => {
+	// The container test is positional and name-based on purpose. A merge that
+	// swallowed every directory below the repository would hide real Workspaces,
+	// and DSH's own managed checkouts are another plugin's rows, not this one's.
+	const lookalike = `${REPO_PATH}\\src\\.dsh-worktrees\\repo_x`;
+	const elsewhere = [
+		sessionRow('session-repo', REPO_PATH, 1),
+		sessionRow('session-dsh', 'C:\\Users\\someone\\.dsh\\worktrees\\proj-abc\\fix', 2),
+		sessionRow('session-plain', `${REPO_PATH}\\src`, 3),
+		sessionRow('session-lookalike', lookalike, 4)
+	];
+	const workspaces = projection(workspaceProjection([workspaceRow('ws-repo', REPO_PATH, ['session-repo'])]));
+	const sessions = projection(sessionProjection(elsewhere));
+	applyPlugin({ workspaces: { list: workspaces }, sessions: { list: sessions } });
+
+	assert.deepEqual(plain(workspaces.getSnapshot().items[0].sessionIds), ['session-repo'],
+		'only a directory DIRECTLY under a container this plugin owns is a worktree of it');
+});
+
+test('a worktree of a worktree resolves to the outermost group, not to a vanishing one', () => {
+	const inner = `${WORKTREE_PATH}\\.dsh-worktrees\\repo_nested`;
+	const workspaces = projection(workspaceProjection([
+		workspaceRow('ws-repo', REPO_PATH, []),
+		workspaceRow('ws-wt', WORKTREE_PATH, []),
+		workspaceRow('ws-inner', inner, ['session-inner'])
+	]));
+	const sessions = projection(sessionProjection([sessionRow('session-inner', inner, 1)]));
+	applyPlugin({ workspaces: { list: workspaces }, sessions: { list: sessions } });
+
+	const merged = workspaces.getSnapshot();
+	assert.equal(merged.items.length, 1, 'both worktree rows are folded away');
+	assert.equal(merged.items[0].workspaceId, 'ws-repo');
+	assert.deepEqual(plain(merged.items[0].sessionIds), ['session-inner']);
+});
+
+test('joining a new worktree starts its Session through the Session Controller', async () => {
+	// With the merge installed, `openWorkspace(worktreeId)` cannot be the call that
+	// starts the Session: it resolves the Workspace out of the merged projection,
+	// where the worktree is deliberately absent, so it would fail AFTER the
+	// directory was created. The openWorkspace below throws for exactly that reason
+	// — a regression here is a failed click, not a silent difference.
+	const opened = [];
+	const registered = [];
+	const created = [];
+	const workspaces = projection(workspaceProjection([workspaceRow('ws-repo', REPO_PATH, [])]));
+	const sessions = projection(sessionProjection([sessionRow('session-repo', REPO_PATH, 1)]));
+	const harness = await mountControl({
+		services: {
+			uiWorkspace: {
+				openSession: (sessionId) => { opened.push(sessionId); },
+				openWorkspace: async (workspaceId) => { throw new Error(`unknown workspace ${workspaceId}`); }
+			},
+			workspaces: {
+				create: async (input) => {
+					registered.push(input.path);
+					return workspaceRow('ws-wt', input.path, []);
+				},
+				list: workspaces
+			},
+			sessions: {
+				list: sessions,
+				create: async (options) => {
+					created.push(options);
+					return 'session-new';
+				}
+			}
+		}
+	});
+
+	const tree = await createThroughPicker(harness, {
+		create: {
+			ok: true,
+			created: { path: WORKTREE_PATH, branch: 'dsh/wt/repo_abc123', base: 'main', reused: false },
+			workspace: { path: WORKTREE_PATH, layout: 'inside', registered: true, workspaceId: 'ws-wt' },
+			session: null,
+			seat: 'client',
+			text: 'created'
+		}
+	});
+
+	assert.deepEqual(registered, [WORKTREE_PATH], 'the directory is still registered as a Workspace on the Host');
+	// Rooted in the worktree AND attached to its Workspace: the Session is created
+	// through that Workspace, which is what keeps its working directory the worktree.
+	assert.deepEqual(plain(created), [{ workspaceId: 'ws-wt' }]);
+	assert.deepEqual(opened, ['session-new'], 'the client creates it, so it is addressable at once and can be selected');
+	assert.match(textOf(tree), /已进入该 worktree 的新会话/);
+});
+
+test('with the merge off, the shipped openWorkspace call is still the one used', async () => {
+	const opened = [];
+	const harness = await mountControl({
+		window: { localStorage: { getItem: () => 'off' } },
+		services: {
+			uiWorkspace: {
+				openSession: () => { throw new Error('openSession must not be the path while the merge is off'); },
+				openWorkspace: async (workspaceId) => { opened.push(workspaceId); }
+			},
+			workspaces: {
+				create: async (input) => workspaceRow('ws-wt', input.path, []),
+				list: projection(workspaceProjection([workspaceRow('ws-repo', REPO_PATH, [])]))
+			}
+		}
+	});
+
+	const tree = await createThroughPicker(harness, {
+		create: {
+			ok: true,
+			created: { path: WORKTREE_PATH, branch: 'dsh/wt/repo_abc123', base: 'main', reused: false },
+			workspace: { path: WORKTREE_PATH, layout: 'inside', registered: true, workspaceId: 'ws-wt' },
+			session: null,
+			seat: 'client',
+			text: 'created'
+		}
+	});
+
+	assert.deepEqual(opened, ['ws-wt']);
+	assert.match(textOf(tree), /已进入该 worktree 的新会话/);
+});
+
+test('a worktree whose group was merged away is still reached by where its session runs', async () => {
+	// The jump entry used to answer by path in the Workspace projection. With the
+	// merge installed that projection no longer holds the worktree's row at all, so
+	// the lookup has to fall back to where the Session RUNS — otherwise "go to an
+	// existing worktree" would claim there is no session on record while that very
+	// session sits in the sidebar.
+	const other = `${REPO_PATH}\\.dsh-worktrees\\repo_other`;
+	const opened = [];
+	const status = insideWorktreeStatus(undefined);
+	status.myWorktrees = [{ path: other, branch: 'dsh/wt/repo_other', base: 'main', ahead: 2, dirty: false }];
+	const harness = await mountControl({
+		cwd: WORKTREE_PATH,
+		routes: { [statusRoute(WORKTREE_PATH)]: status },
+		services: {
+			uiWorkspace: { openSession: (sessionId) => opened.push(sessionId) },
+			// The projection as it looks AFTER the merge: the other worktree is not a
+			// Workspace row here any more, so a lookup by path cannot find it.
+			workspaces: { list: projection(workspaceProjection([workspaceRow('ws-repo', REPO_PATH, ['session-me'])])) },
+			sessions: {
+				list: projection(sessionProjection([
+					sessionRow('session-elsewhere', REPO_PATH, 1),
+					sessionRow('session-in-other-worktree', other, 5)
+				]))
+			}
+		}
+	});
+
+	const entries = await openMenu(harness);
+	const jump = entries.find((entry) => textOf(entry).includes('跳回已有 worktree'));
+	assert.ok(jump !== undefined, 'the worktree this plugin made is still offered');
+	await harness.driver.click(jump);
+
+	assert.deepEqual(opened, ['session-in-other-worktree'], 'the session is found by its working directory');
+	assert.match(textOf(harness.driver.tree), /已切换到该 worktree 的会话/);
 });
