@@ -67,6 +67,14 @@
  * the switch ({@link sidebarMergeEnabled}) a pure display change, and what makes
  * the merge survive a reload for sessions this plugin did not start.
  *
+ * Folding the rows together is only half the job: a worktree Session and the
+ * repository's own then LOOK identical in one group, which is how the user read
+ * it. So the merge is followed by a mark — {@link WorktreeRowIcon}, one branch
+ * glyph in the leading cell of a Session row whose live `cwd` is this plugin's
+ * worktree, in DSH's own seat for that cell (`sidebar.session.row.leading`). The
+ * same container rule decides both, which is why the icon and the merge can never
+ * disagree about which rows are worktrees.
+ *
  * The order is not a shortcut around the Host; it is the only one that works. A
  * session started ON the Host is unknown to this client until a later list
  * refresh, and `sessions.retain()` — the call navigation makes — throws
@@ -190,7 +198,14 @@ window.__ModuleLoader__.load({
 				.filter((part) => part !== '');
 		}
 
-		/** Whether `ancestor` is a PROPER ancestor directory of `descendant`. */
+		/**
+		 * Whether `ancestor` is a PROPER ancestor directory of `descendant`.
+		 *
+		 * "Proper" is load-bearing, not pedantry: a directory is not above itself, and
+		 * every caller here asks whether one place CONTAINS another. Treating equality
+		 * as containment made a registered `.dsh-worktrees` container its own owner and
+		 * therefore a worktree — and made a workspace its own parent in the merge.
+		 */
 		function isAncestorPath(ancestor, descendant) {
 			const from = segmentsOf(ancestor);
 			const to = segmentsOf(descendant);
@@ -606,6 +621,10 @@ window.__ModuleLoader__.load({
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dshwt-note{font-size:11px;line-height:15px;color:var(--dsw-alias-label-secondary);padding:4px 8px 6px;max-width:320px;white-space:normal}
 .dshwt-sep{height:1px;margin:4px 2px;background:var(--dsw-alias-border-l1)}
+/* The sidebar's mark for a worktree Session, in the leading cell of its row. It
+   borrows that row's own colour (a mark that announced itself in a colour of its
+   own would read as a status), and it is sized to the 16px cell it sits in. */
+.dshwt-row-icon{display:block;width:12px;height:12px;margin:0 auto;color:inherit;opacity:.75}
 `;
 
 		/** One JSON call, with the contract the host routes implement. */
@@ -769,6 +788,147 @@ window.__ModuleLoader__.load({
 					d: 'M5 2.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm0 1a.5.5 0 1 1 0 1 .5.5 0 0 1 0-1Zm6 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm0 1a.5.5 0 1 1 0 1 .5.5 0 0 1 0-1ZM4.5 5.6v3.9a2.5 2.5 0 0 0 2.5 2.5h2a2.5 2.5 0 0 0 2.5-2.5V5.6a2 2 0 0 1-1-.4v4.3a1.5 1.5 0 0 1-1.5 1.5h-2A1.5 1.5 0 0 1 5.5 9.5V5.2a2 2 0 0 1-1 .4Zm5.4.9a2.5 2.5 0 0 0 2.6-2.5V3.5a.5.5 0 0 0-1 0V4a1.5 1.5 0 0 1-1.6 1.5.5.5 0 0 0 0 1Z'
 				})
 			);
+		}
+
+		/* --------------------------------------------- the sidebar branch icon -- */
+
+		/**
+		 * Whether `directory` sits directly under a container THIS plugin cuts
+		 * worktrees in — the directory-only half of the row icon's decision.
+		 *
+		 * It exists so the mark survives a sidebar that has drawn a row before the
+		 * Workspace projection arrived, and it stays as narrow as the projection rule:
+		 * the container must be a segment of the path, something must live BELOW it,
+		 * and the directory above it must be a registered path. That last clause is
+		 * what keeps `repo\notes\.dsh-worktrees\wt` — a container that is merely a
+		 * subdirectory's name — from being marked, which a bare "is there a container
+		 * segment" test would get wrong.
+		 */
+		function insideWorktreeContainer(directory, owners) {
+			const segments = segmentsOf(directory);
+			for (let index = 0; index < segments.length - 1; index += 1) {
+				if (worktreeContainerName(segments[index]) === null) continue;
+				const above = segments.slice(0, index).join('/');
+				for (const owner of owners) {
+					if (sameDir(owner, above) && worktreeInside(owner, directory)) return true;
+				}
+			}
+			return false;
+		}
+
+		/**
+		 * The registered Workspace paths, as the sidebar's own projection holds them.
+		 *
+		 * Read for ONE reason: {@link worktreeInside} needs the repository a directory
+		 * was cut from, and the projection is where the registered repository lives.
+		 */
+		function workspacePaths(projection) {
+			const items = projection !== null && typeof projection === 'object' && Array.isArray(projection.items)
+				? projection.items
+				: [];
+			const paths = [];
+			for (const item of items) {
+				if (item === null || typeof item !== 'object' || typeof item.path !== 'string') continue;
+				paths.push(item.path);
+			}
+			return paths;
+		}
+
+		/**
+		 * Whether `cwd` is a worktree THIS plugin created.
+		 *
+		 * Both halves of the rule the sidebar merge uses, in the order that matters:
+		 * the directory must be a worktree of a REGISTERED repository — positional, so
+		 * the first segment below the repository is a container name and something
+		 * lives below it — and failing that it must at least sit under such a
+		 * container. A plain subdirectory, a repository, and DSH's own managed
+		 * checkout are all none of them, which is what keeps the icon a statement
+		 * about worktrees rather than a decoration every row grows.
+		 */
+		function sessionRunsInWorktree(cwd, owners) {
+			if (typeof cwd !== 'string' || cwd === '') return false;
+			for (const owner of owners) {
+				// {@link worktreeInside} is proper-ancestor-only, so a registered path
+				// never answers for itself: the container directory is not the worktree
+				// below it, and a workspace is not its own repository.
+				if (worktreeInside(owner, cwd)) return true;
+			}
+			return insideWorktreeContainer(cwd, owners);
+		}
+
+		/**
+		 * The Session's working directory, subscribed to the smallest slice.
+		 *
+		 * A thunk rather than a value — `useSessions` IS a hook and would break the
+		 * rules of hooks if the caller only sometimes reached it — and null when the
+		 * page's occupant gets no Session id, which is also the shape that hides the
+		 * icon rather than guessing at one.
+		 */
+		function useWorktreeIconState(props) {
+			const sessionId = props && typeof props.sessionId === 'string' ? props.sessionId : null;
+			const useSessions = props && props.useSessions;
+			const useWorkspaces = props && props.useWorkspaces;
+			const cwd = useSessions && sessionId !== null
+				? useSessions((state) => (state && state.byId && state.byId[sessionId] ? state.byId[sessionId].cwd : undefined))
+				: undefined;
+			// The whole projection, deliberately: `useWorkspaces` is a selector over a
+			// STABLE snapshot, so an identity comparison inside the selector is safe,
+			// while a selector BUILDING a path array would hand back a fresh object per
+			// store notification and re-render this row forever.
+			const projection = useWorkspaces ? useWorkspaces((state) => state) : null;
+			// One decision per (session, directory, Workspace set), which is what keeps
+			// the per-store-notification pass free of repeated path work — and the
+			// identity comparison that does it is only valid because `cwd` is a string.
+			const memo = React.useRef(null);
+			const owners = workspacePaths(projection);
+			const key = `${sessionId ?? ''}\u0000${typeof cwd === 'string' ? cwd : ''}\u0000${owners.join('\u0001')}`;
+			if (memo.current === null || memo.current.key !== key) {
+				memo.current = { key, value: sessionRunsInWorktree(cwd, owners) };
+			}
+			return memo.current.value;
+		}
+
+		/**
+		 * The branch icon in front of ONE sidebar Session row.
+		 *
+		 * ## Why it exists
+		 *
+		 * The sidebar merge above folds a worktree's Session into the repository's own
+		 * group, which is what the user asked for — and it also made the two
+		 * indistinguishable on screen: "the new worktree's session and the session in
+		 * the main workspace look the same". This is the mark that says WHICH one is
+		 * which, in the seat DSH declares for exactly this purpose: `sidebar.session
+		 * .row.leading`, the 16px cell "before the title".
+		 *
+		 * ## What it is, and is not
+		 *
+		 * It is a READ: the Session's live `cwd` (the `useSessions` store) against the
+		 * registered Workspace paths, decided by the same container rule the merge
+		 * uses. Nothing is invented from a click, nothing is polled, no Session is
+		 * moved, and a row that is not a worktree renders `null` — the cell this
+		 * component occupies, and therefore the shipped status dot, is untouched.
+		 *
+		 * It is registered separately from the composer control because it is a
+		 * different seat with a different job: the control acts on a directory, this
+		 * marks a row. Two seats of the SAME component is what this plugin already
+		 * learned not to do (see the file header) — the state duplication that made a
+		 * banner appear twice. There is no shared state here to duplicate: this
+		 * component has no state at all.
+		 */
+		function WorktreeRowIcon(props) {
+			if (useWorktreeIconState(props) !== true) return null;
+			return h('svg', {
+				className: 'dshwt-row-icon',
+				width: 12,
+				height: 12,
+				viewBox: '0 0 16 16',
+				role: 'img',
+				'aria-label': 'worktree 中的会话 / session in a worktree'
+			},
+			h('path', {
+				fill: 'currentColor',
+				d: 'M5 2.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm0 1a.5.5 0 1 1 0 1 .5.5 0 0 1 0-1Zm6 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Zm0 1a.5.5 0 1 1 0 1 .5.5 0 0 1 0-1ZM4.5 5.6v3.9a2.5 2.5 0 0 0 2.5 2.5h2a2.5 2.5 0 0 0 2.5-2.5V5.6a2 2 0 0 1-1-.4v4.3a1.5 1.5 0 0 1-1.5 1.5h-2A1.5 1.5 0 0 1 5.5 9.5V5.2a2 2 0 0 1-1 .4Zm5.4.9a2.5 2.5 0 0 0 2.6-2.5V3.5a.5.5 0 0 0-1 0V4a1.5 1.5 0 0 1-1.6 1.5.5.5 0 0 0 0 1Z'
+			}));
 		}
 
 		/** A commit glyph: the dot a commit is drawn as, on its line. */
@@ -1383,17 +1543,30 @@ window.__ModuleLoader__.load({
 				// `false` — no Workspace projection, no Session projection, or the browser
 				// switched it off — leaves every shipped surface exactly as it was.
 				services.sidebarMerge = installSidebarMerge(services);
-				// ONE seat, deliberately. `conversation.input.left` is the composer
+				// The control's seat. `conversation.input.left` is the composer
 				// toolbar: ambient, so it exists before the first message, and present in
-				// every session. Registering a second seat is what put two copies of this
-				// control — and of every message it shows — on screen at once, because the
-				// component is then genuinely mounted twice with two copies of its state.
+				// every session. Registering THIS component in a second seat is what put
+				// two copies of it — and of every message it shows — on screen at once,
+				// because it is then genuinely mounted twice with two copies of its
+				// state; the seat below is a different component with no state to share.
 				ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
 					name: 'conversation.input.left',
 					id: 'dsh-local-worktree',
 					order: 20,
 					label: 'Git worktree'
 				}, GitWorktreeControl));
+				// The second seat, and a different question: this one MARKS a Session
+				// row instead of acting on a directory, which is what tells a worktree's
+				// Session apart from the repository's own now that the merge puts them
+				// in one group. Read-only, and mounted only where a leading cell is
+				// drawn — see {@link WorktreeRowIcon} for why it is a separate
+				// registration rather than a second seat of the control above.
+				ctx.slots.inject('sidebar.session.row.leading', () => ctx.slots.register({
+					name: 'sidebar.session.row.leading',
+					id: 'dsh-local-worktree',
+					order: 1,
+					label: 'Git worktree'
+				}, WorktreeRowIcon));
 			}
 		};
 	}

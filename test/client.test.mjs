@@ -137,7 +137,11 @@ test('the popover surface is opaque, so text is never read through', () => {
 	assert.match(rule, /z-index:\s*\d{3,}/, 'the menu is opened over the composer, so it needs a high layer');
 });
 
-test('the control is registered in exactly ONE seat, so nothing can be rendered twice', () => {
+/** The row icon's seat. The control below is the OTHER seat the plugin registers. */
+const ROW_ICON_SEAT = 'sidebar.session.row.leading';
+const CONTROL_SEAT = 'conversation.input.left';
+
+test('the control and the row mark are registered in DIFFERENT seats, one entry each', () => {
 	const definition = loadDefinition();
 	const plugin = definition.factory(() => ({ createElement: () => null, Fragment: 'Fragment' }));
 	const registrations = [];
@@ -151,13 +155,19 @@ test('the control is registered in exactly ONE seat, so nothing can be rendered 
 		}
 	});
 
-	// One seat only. Two registrations of the same component mount it twice, with
-	// two copies of its state, so every message it shows appears twice on screen —
-	// which is precisely what happened. There is no per-seat switch to get wrong now.
-	assert.deepEqual(injected, ['conversation.input.left']);
-	assert.equal(registrations.length, 1);
-	assert.equal(registrations[0].meta.id, PACKAGE.name);
-	assert.equal(registrations[0].meta.name, 'conversation.input.left');
+	// TWO seats, and they are not two copies of one thing: the composer toolbar acts
+	// on a directory (its own state, one entry), while the Session row is a read-only
+	// mark (no state at all). Rendering ONE component in two seats is what put two
+	// identical banners on screen — the mistake this pins against is a second entry
+	// in EITHER seat, which is what would double the control or double the mark.
+	assert.deepEqual(injected, [CONTROL_SEAT, ROW_ICON_SEAT]);
+	assert.equal(registrations.length, 2, 'one entry per seat, no more');
+	const control = registrations.find((entry) => entry.meta.name === CONTROL_SEAT);
+	const rowIcon = registrations.find((entry) => entry.meta.name === ROW_ICON_SEAT);
+	assert.ok(control !== undefined, 'the composer toolbar still hosts the control');
+	assert.ok(rowIcon !== undefined, 'the Session row hosts the branch mark');
+	assert.equal(control.meta.id, PACKAGE.name);
+	assert.equal(rowIcon.meta.id, PACKAGE.name);
 	// The composer toolbar is ambient, so it also covers the Hero — before there is
 	// any session working directory — which the session header does not.
 	assert.equal(CODE_ONLY.includes("conversation.session.header.utilities"), false,
@@ -183,6 +193,105 @@ test('the declared injects cover what the component actually uses', () => {
 	}
 });
 
+/* ------------------------------------------- the sidebar worktree row mark -- */
+
+/**
+ * Mount the Session-row mark with a real store, the way the sidebar mounts it.
+ *
+ * The two things the occupant is handed are the row's Session ID and the page's
+ * standard hooks (`useSessions`, `useWorkspaces`); the projections behind those
+ * hooks are the ones the sidebar was rendering from, which is what makes "no
+ * projection yet" as testable as a full one.
+ *
+ * React comes from the sandbox the bundle was loaded in — the stub is what the
+ * bundle's `require('react')` answered — because a component built in one realm
+ * cannot call hooks belonging to another.
+ */
+function mountRowIcon({ cwd, workspaces = null } = {}) {
+	const { React, driver } = createReactStub();
+	const seats = registeredSeats({}, {}, React);
+	const workspaceStore = projection(workspaces ?? workspaceProjection([]));
+	const sessionStore = projection(sessionProjection(cwd === undefined ? [] : [sessionRow('session-row', cwd, 1)]));
+	// Both hooks hand their selector the SNAPSHOT, exactly as the page's projection
+	// hooks do; a stub that passed the projection object instead would make
+	// `projection.items` undefined, which is the "no projection yet" case and not the
+	// case under test.
+	const props = {
+		sessionId: 'session-row',
+		useSessions: (select) => select(sessionStore.getSnapshot()),
+		useWorkspaces: (select) => select(workspaceStore.getSnapshot())
+	};
+	assert.ok(typeof seats[ROW_ICON_SEAT] === 'function', 'the row mark is registered in the leading cell');
+	return driver.mount(seats[ROW_ICON_SEAT], props).then((tree) => ({ driver, tree, props }));
+}
+
+/** Whether a rendered tree is the branch mark, and not merely an empty cell. */
+const hasRowIcon = (tree) => findAll(tree, (node) => node.props.className === 'dshwt-row-icon').length > 0;
+
+test('a Session in one of this plugin\'s worktrees is marked with a branch icon', async () => {
+	const rows = [workspaceRow('ws-repo', REPO_PATH, [])];
+	const { tree } = await mountRowIcon({ cwd: WORKTREE_PATH, workspaces: workspaceProjection(rows) });
+	assert.equal(hasRowIcon(tree), true, 'the worktree row carries the mark');
+	const icon = findAll(tree, (node) => node.props.className === 'dshwt-row-icon')[0];
+	// The mark is a decoration with a name: a row read by a screen reader says which
+	// of two otherwise identical sessions it is.
+	assert.equal(icon.props.role, 'img');
+	assert.match(String(icon.props['aria-label']), /worktree/);
+});
+
+test('the repository\'s own Session is left exactly as the sidebar drew it', async () => {
+	const { tree } = await mountRowIcon({
+		cwd: REPO_PATH,
+		workspaces: workspaceProjection([workspaceRow('ws-repo', REPO_PATH, [])])
+	});
+	assert.equal(hasRowIcon(tree), false, 'no git glyph beside a Session that is not a worktree');
+	assert.equal(tree, null, 'the leading cell stays empty rather than being filled with a placeholder');
+});
+
+test('a directory that merely looks like a container is not a worktree', async () => {
+	// The rule is positional, and it is the merge's rule: something must live UNDER
+	// a container, and that container must be the first segment below a registered
+	// path. A directory that IS a container, a container belonging to a plain
+	// subdirectory, and an ordinary directory are all left unmarked — a false
+	// positive here would put a git glyph on rows that have nothing to do with it.
+	const workspaces = workspaceProjection([workspaceRow('ws-repo', REPO_PATH, [])]);
+	// Built with a single separator, exactly as the REPO_PATH constant is: `\.` is
+	// the same character as `\\.` here, and writing two would build a path no page
+	// ever produces (`\\` collapses empty segments away and tests nothing).
+	for (const cwd of [
+		`${REPO_PATH}\.dsh-worktrees`,
+		`${REPO_PATH}\notes\.dsh-worktrees\wt`,
+		`${REPO_PATH}\src`
+	]) {
+		const { tree } = await mountRowIcon({ cwd, workspaces });
+		assert.equal(hasRowIcon(tree), false, `${cwd} is not one of this plugin's worktrees`);
+	}
+});
+
+test('the mark survives a sidebar that has not drawn the Workspace projection yet', async () => {
+	// The icon reads the directory as well as the projections, so a row rendered
+	// before the Workspace list arrives is marked instead of silently unmarked — and
+	// the container has to hang off a registered path, which is what keeps the
+	// fallback from marking every row on a page whose list is empty.
+	const registered = workspaceProjection([workspaceRow('ws-repo', REPO_PATH, [])]);
+	const { tree } = await mountRowIcon({ cwd: WORKTREE_PATH, workspaces: registered });
+	assert.equal(hasRowIcon(tree), true, 'the worktree is recognised without needing the merge');
+	const { tree: plainTree } = await mountRowIcon({ cwd: REPO_PATH, workspaces: registered });
+	assert.equal(hasRowIcon(plainTree), false, 'an ordinary directory never is');
+});
+
+test('a row with no Session id gains no mark from a guess', async () => {
+	const { React, driver } = createReactStub();
+	const seats = registeredSeats({}, {}, React);
+	// The seat is documented to receive the row's Session id; a composition that
+	// handed it nothing must render an empty cell rather than the FIRST session.
+	const tree = await driver.mount(seats[ROW_ICON_SEAT], {
+		useSessions: (select) => select(sessionProjection([sessionRow('someone-else', WORKTREE_PATH, 1)])),
+		useWorkspaces: (select) => select(workspaceProjection([]))
+	});
+	assert.equal(hasRowIcon(tree), false);
+});
+
 test('no message is rendered from more than one place', () => {
 	// The banner that made the layout messy existed because the component was
 	// mounted twice and each mount kept its own notice state. With one seat there is
@@ -199,13 +308,12 @@ test('a missing uiWorkspace costs the navigation, not the control', () => {
 	const definition = loadDefinition();
 	const plugin = definition.factory(() => ({ createElement: () => null, Fragment: 'Fragment' }));
 	// No `uiWorkspace` anywhere: the control must still register and work, minus the
-	// automatic jump.
+	// automatic jump. The row mark needs no service at all, so both seats are filled.
 	const registrations = [];
 	assert.doesNotThrow(() => plugin.apply({
 		slots: { inject: (_key, callback) => callback(), register: (meta, component) => { registrations.push(meta); return () => {}; } }
 	}));
-	assert.equal(registrations.length, 1);
-	assert.equal(registrations[0].name, 'conversation.input.left');
+	assert.deepEqual(registrations.map((meta) => meta.name), [CONTROL_SEAT, ROW_ICON_SEAT]);
 });
 
 /* --------------------------------------------------- the create click path -- */
@@ -373,7 +481,9 @@ async function mountControl({ services = {}, cwd = undefined, session = {}, rout
 		get: (name) => resolved[name] ?? undefined,
 		slots: {
 			inject: (_key, callback) => callback(),
-			register: (_meta, value) => { component = value; return () => {}; }
+			// The CONTROL's seat. The row mark is a second registration and belongs to
+			// another harness — mounting it here would replace the component under test.
+			register: (meta, value) => { if (meta.name === CONTROL_SEAT) component = value; return () => {}; }
 		}
 	});
 	// A session that already has a working directory must have its FIRST status read
@@ -974,6 +1084,32 @@ function applyPlugin(services, windowExtra = {}) {
 		slots: { inject: (_key, callback) => callback(), register: () => () => {} }
 	});
 	return services;
+}
+
+/**
+ * The components the bundle registered, by seat.
+ *
+ * The plugin fills TWO seats and a page hands the occupant to the sidebar and to
+ * the composer separately, so a harness that kept only the last registration would
+ * be mounting the row mark where the control belongs. `React` is the module the
+ * bundle's `require('react')` answers, because a component from one realm cannot
+ * call hooks belonging to another.
+ */
+function registeredSeats(services = {}, windowExtra = {}, React = { createElement: () => null, Fragment: 'Fragment' }) {
+	const definition = loadDefinition({}, windowExtra);
+	const plugin = definition.factory(() => React);
+	const seats = {};
+	plugin.apply({
+		uiWorkspace: services.uiWorkspace ?? null,
+		workspaces: services.workspaces ?? null,
+		sessions: services.sessions ?? null,
+		get: (name) => services[name] ?? undefined,
+		slots: {
+			inject: (_key, callback) => callback(),
+			register: (meta, component) => { seats[meta.name] = component; return () => {}; }
+		}
+	});
+	return seats;
 }
 
 /** The repository plus one worktree, as the Host reports both. */
