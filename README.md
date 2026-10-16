@@ -69,6 +69,21 @@ worktree sessions are started from this plugin's own control. The group's **New
 session** button creates a session in the repository, which is what its group
 means.
 
+### The branch icon: telling the two apart
+
+Folding the rows into one group is only half the job — a worktree's Session and the
+repository's own then sit side by side *looking identical*, which is exactly how
+the user read it. So a Session whose live `cwd` is one of this plugin's worktrees
+carries a **branch glyph** in the leading cell of its sidebar row (DSH's
+`sidebar.session.row.leading` seat: the 16px cell before the title).
+
+The same positional rule decides both the merge and the icon, so they can never
+disagree about which rows are worktrees; a row that is not one renders nothing and
+keeps whatever the sidebar drew there. It is a read-only mark — the Session's
+`cwd` from the session store, the registered paths from the Workspace projection,
+no click and no polling — and it works with the merge switched off, where the icon
+is what still says which group holds a worktree.
+
 Every click mints a **new** `app_<timestamp+random>` directory, so two clicks are
 two worktrees rather than one reused one.
 
@@ -292,9 +307,15 @@ the base branch, a second delivery is refused with `already-merged`.
 
 ## Install
 
+Clone the repository, then point the plugin manager at the checkout:
+
 ```
-dsh plugin add C:\Workspace\dsh-local-worktree
+git clone https://github.com/xtk923/dsh-local-worktree
+dsh plugin add <path-to-your-checkout>
 ```
+
+On Windows the path looks like `C:\path\to\dsh-local-worktree`; on Linux and
+macOS, `/path/to/dsh-local-worktree`.
 
 or, from inside DSH, `plugin_manager` with `action: "install_bundle"` and this
 directory as the target. The bundle patch inserts one host row; the browser half

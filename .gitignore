@@ -62,6 +62,13 @@ credentials.json
 .dsh/credentials*
 auth.json
 
+# --- security tooling state -------------------------------------------------
+# dsh-code-security writes its scan state to `.code-security/`. It is machine
+# state, not source: it records absolute paths from the scanning machine, and the
+# only thing it contributes to a reader is noise. Ignored rather than left
+# untracked so a `git add -A` in a pre-publication sweep cannot commit it.
+.code-security/
+
 # --- this plugin's runtime artifacts ----------------------------------------
 # `.dsh-worktree.json` records the base branch of a worktree. The plugin writes
 # it into the WORKTREE'S GIT DIR precisely so it cannot be committed, and falls
