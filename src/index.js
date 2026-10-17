@@ -52,7 +52,7 @@ import {
 	dropWorktree,
 	saveRegistry
 } from './registry.js';
-import { bothText, committedText, deliveredText, reasonText } from './text.js';
+import { bothText, committedText, deliveredText, hintText, reasonText } from './text.js';
 import { GitFailure, Workspace } from './workspace.js';
 
 export const name = 'dsh-local-worktree';
@@ -713,7 +713,7 @@ export function createApi(ctx, rawConfig) {
 				commits: result.commits,
 				mainHead: result.mainHead,
 				preCommitted: result.preCommitted === true,
-				cleanup: result.cleanup ?? null,
+				cleanup: describeCleanup(result.cleanup),
 				text: deliveredText(result)
 			};
 		});
@@ -788,6 +788,10 @@ export function createApi(ctx, rawConfig) {
 				removed: result.removed === true,
 				branchDeleted: result.branchDeleted === true,
 				reason: result.reason ?? null,
+				// Discard removes a directory too, so it can fail for the same reasons a
+				// delivery does; the same rule applies — never show a bare code.
+				reasonText: result.reason ? bothText(result.reason) : null,
+				hint: hintText(result.reason ?? ''),
 				text: result.ok === true ? '已丢弃 worktree / worktree discarded' : null
 			};
 		});
@@ -860,6 +864,26 @@ export function createApi(ctx, rawConfig) {
 	api.workspacesAction = workspacesAction;
 
 	return api;
+}
+
+/**
+ * The cleanup half of a delivery, said in words.
+ *
+ * `reason` alone is a code, and the person who just clicked has already been told
+ * a worktree "could not be removed" — the question they are left with is why, and
+ * what to change. So the reason gets its sentence, git's own first line rides
+ * along as `detail`, and the one failure whose next step is not obvious gets a
+ * hint. `--force` cannot delete a directory that is in use, which is exactly the
+ * advice a bare "path in use" would invite someone to try.
+ */
+function describeCleanup(cleanup) {
+	if (cleanup === null || cleanup === undefined) return null;
+	const reason = typeof cleanup.reason === 'string' ? cleanup.reason : '';
+	return {
+		...cleanup,
+		reasonText: reason === '' ? '' : bothText(reason),
+		hint: hintText(reason)
+	};
 }
 
 /**
@@ -1173,12 +1197,18 @@ function attachCommand(ctx, api) {
 				return { kind: 'error', text: `${answer.reasonText ?? reasonText(answer.reason, { lang: 'both' })}${answer.hint ? `\n${answer.hint}` : ''}` };
 			}
 			// The same three outcomes the button reports, for the same reason: a
-			// requested removal that git refused must not read as "kept on purpose".
+			// requested removal that git refused must not read as "kept on purpose",
+			// and it must carry WHY — a typed command is the surface most likely to be
+			// used by someone who then has to clean up by hand.
+			const why = [answer.cleanup?.reasonText, answer.cleanup?.detail]
+				.filter((part) => typeof part === 'string' && part !== '')
+				.join('：');
+			const hint = typeof answer.cleanup?.hint === 'string' && answer.cleanup.hint !== '' ? `\n${answer.cleanup.hint}` : '';
 			const outcome = answer.cleanup === null || answer.cleanup === undefined
 				? '\nworktree 已保留 / the worktree was kept'
 				: answer.cleanup.removed === true
 					? '\nworktree 已删除 / the worktree was removed'
-					: '\nworktree 未能删除，已保留 / the worktree could not be removed and was kept';
+					: `\nworktree 未能删除${why === '' ? '' : `（${why}）`}，已保留 / the worktree could not be removed and was kept${hint}`;
 			return { kind: 'success', text: `${answer.text}${outcome}` };
 		}
 		return { kind: 'error', text: COMMAND.usage };

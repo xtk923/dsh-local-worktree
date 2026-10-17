@@ -20,7 +20,7 @@
  * @module dsh-local-worktree/workspace
  */
 
-import { mkdir, readFile, rmdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rmdir, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 
 import {
@@ -59,6 +59,21 @@ import {
 
 /** The plugin's own branch namespace; only these are ever deleted. */
 const OWN_BRANCH = /^dsh\/wt\//;
+
+/**
+ * How many times a removal that hit a busy path is retried, and how long the
+ * retries wait.
+ *
+ * A directory held by a scanner, the search indexer or an exiting process is free
+ * again in a few hundred milliseconds; a directory held by a running dev server is
+ * not, and waiting longer would only make the click feel broken. Three attempts
+ * spanning well under a second covers the first case and reports the second.
+ */
+const REMOVE_ATTEMPTS = 3;
+const REMOVE_BACKOFF_MS = [150, 600];
+
+/** Longest git error line kept as `detail`, so a payload stays readable. */
+const DETAIL_MAX = 300;
 
 /** A git invocation that failed, with the reason code the UI renders. */
 export class GitFailure extends Error {
@@ -100,11 +115,14 @@ export class Workspace {
 	 * @param run - `(args: string[], options?: { cwd?: string }) => Promise<{ exitCode, stdout, stderr }>`
 	 * @param options.onWarn - sink for non-fatal problems, never a logger dependency.
 	 * @param options.layout - `sibling` (default) or `inside`; see {@link worktreeContainer}.
+	 * @param options.sleep - the wait between removal retries, injected so a test
+	 *   can assert the retry without spending the backoff.
 	 */
-	constructor(run, { onWarn, layout } = {}) {
+	constructor(run, { onWarn, layout, sleep } = {}) {
 		if (typeof run !== 'function') throw new TypeError('Workspace requires a git runner');
 		this.run = run;
 		this.onWarn = typeof onWarn === 'function' ? onWarn : () => {};
+		this.sleep = typeof sleep === 'function' ? sleep : (ms) => new Promise((done) => { setTimeout(done, ms); });
 		// Fixed for the life of the instance: where a worktree lands decides the
 		// repository's `.git/info/exclude` line and the path a session is rooted at,
 		// so switching it halfway would leave both half-applied.
@@ -681,24 +699,52 @@ export class Workspace {
 	 * `-d` (never `-D`) for the branch: if the commits are not merged, git
 	 * refuses and the branch survives. Silently forcing that delete is how a
 	 * plugin loses somebody's only copy of a day's work.
+	 *
+	 * Removal is RETRIED, but only for one reason: `path-in-use`. That is the
+	 * Windows case — a directory cannot be deleted while a live process holds it
+	 * (its current directory, an open handle to a file inside, a scanner that just
+	 * read the tree), and such a hold is usually gone a few hundred milliseconds
+	 * later. A dirty worktree, a bad ref or a refusal is a decision, not a race,
+	 * and retrying those would only make the button feel slow.
+	 *
+	 * When git still refuses, the worktree has ALREADY lost its contents:
+	 * `git worktree remove` deletes every file first and removes the directory
+	 * itself last. A refused last step therefore leaves an EMPTY shell, and — once
+	 * the next `git worktree prune` drops its metadata — an orphan directory plus
+	 * an orphan branch that nothing ever cleans up. That shell is reclaimed here,
+	 * but only when it holds no file at all and no `.git` marker, which is exactly
+	 * the state git left it in; anything else is the user's directory.
 	 */
-	async cleanup(repoRoot, { path, branch, force = false } = {}) {
+	async cleanup(repoRoot, { path, branch, force = false, attempts = REMOVE_ATTEMPTS } = {}) {
 		const root = resolve(String(repoRoot));
-		const steps = cleanupSteps({ path, branch, force, deleteBranch: typeof branch === 'string' && OWN_BRANCH.test(branch) });
+		const target = typeof path === 'string' && path !== '' ? resolve(path) : String(path ?? '');
+		const deleteBranch = typeof branch === 'string' && OWN_BRANCH.test(branch);
 		const results = [];
-		for (const step of steps) {
+
+		// The removal is not taken from `cleanupSteps`, because it is the one step
+		// that is retried and whose empty-shell outcome is inspected. The argv still
+		// comes from `#removeWorktree`, which builds it from the same place.
+		const removal = await this.#removeWorktree(root, target, { force, attempts });
+		results.push(removal.step);
+		if (removal.ok !== true) {
+			if ((await this.#reclaimShell(target)) !== true) {
+				return { ok: false, removed: false, reason: removal.reason, detail: removal.detail, steps: results };
+			}
+			results.push({ id: 'reclaim', ok: true, reason: removal.reason });
+		}
+
+		// Branch and prune still come from `cleanupSteps`, so their argv lives in
+		// git.js with everything else. A branch delete that git refuses (`-d`, an
+		// unmerged branch) is data, not a failed cleanup.
+		for (const step of cleanupSteps({ path: target, branch, force, deleteBranch }).filter((entry) => entry.id !== 'remove')) {
 			const result = await this.#run(root, gitArgs(step.args, { cwd: root }));
 			if (result.exitCode !== 0) {
-				const reason = classifyGitFailure(result);
-				// `git worktree remove` refuses on a dirty tree. Falling back to a
-				// forced removal is NOT automatic: the caller asked for it or not.
-				results.push({ id: step.id, ok: false, reason });
-				if (step.id === 'remove') return { ok: false, removed: false, reason, steps: results };
+				results.push({ id: step.id, ok: false, reason: classifyGitFailure(result) });
 				continue;
 			}
 			results.push({ id: step.id, ok: true });
 		}
-		await this.#removeEmptyContainer(root, path);
+		await this.#removeEmptyContainer(root, target);
 		return { ok: true, removed: true, branchDeleted: results.some((entry) => entry.id === 'branch' && entry.ok), steps: results };
 	}
 
@@ -778,6 +824,69 @@ export class Workspace {
 		if (!within(container, removedPath)) return false;
 		try {
 			await rmdir(container);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Run the removal step, retrying only a path that is momentarily in use.
+	 *
+	 * Returns git's own first error line as `detail` when it gives up, so a caller
+	 * can say WHY a worktree survived instead of only that it did.
+	 */
+	async #removeWorktree(root, path, { force = false, attempts = REMOVE_ATTEMPTS } = {}) {
+		if (typeof path !== 'string' || path === '') {
+			return { ok: false, reason: 'invalid-path', detail: '', step: { id: 'remove', ok: false, reason: 'invalid-path', attempts: 0 } };
+		}
+		const args = gitArgs(['worktree', 'remove', ...(force === true ? ['--force'] : []), '--', path], { cwd: root });
+		const total = Math.max(1, Number(attempts) || 1);
+		let failure = null;
+		let tried = 0;
+		for (let attempt = 1; attempt <= total; attempt += 1) {
+			tried = attempt;
+			const result = await this.#run(root, args);
+			if (result.exitCode === 0) {
+				return { ok: true, step: { id: 'remove', ok: true, attempts: attempt } };
+			}
+			const current = { reason: classifyGitFailure(result), detail: firstLine(result.stderr) || firstLine(result.stdout) };
+			// A first attempt that emptied the tree makes the NEXT attempt answer
+			// `worktree-gone` (its `.git` pointer is gone), which describes the
+			// consequence, not the cause. The cause — the busy path — is what the user
+			// needs, so it is the one kept.
+			if (failure === null || current.reason !== 'worktree-gone') failure = current;
+			// Only a busy path can stop being busy on its own. Anything else — a dirty
+			// worktree, a bad ref, an unregistered path — is an answer, and asking
+			// again would produce the same answer more slowly.
+			if (current.reason !== 'path-in-use') break;
+			if (attempt < total) await this.sleep(REMOVE_BACKOFF_MS[Math.min(attempt - 1, REMOVE_BACKOFF_MS.length - 1)]);
+		}
+		const step = { id: 'remove', ok: false, reason: failure.reason, detail: failure.detail, attempts: tried };
+		return { ok: false, reason: failure.reason, detail: failure.detail, step };
+	}
+
+	/**
+	 * Delete the empty shell a refused removal leaves behind.
+	 *
+	 * Guarded twice, because deleting a directory is not undoable: the path must
+	 * hold NO entry at all (git deleted every file already, so nothing can be lost)
+	 * and must have no `.git` marker (so git still considers it a working tree only
+	 * when it does). A path that is already gone counts as reclaimed.
+	 */
+	async #reclaimShell(path) {
+		if (typeof path !== 'string' || path === '') return false;
+		if ((await pathExists(path)) !== true) return true;
+		if ((await gitMarker(path)) !== null) return false;
+		let entries;
+		try {
+			entries = await readdir(path);
+		} catch {
+			return false;
+		}
+		if (entries.length !== 0) return false;
+		try {
+			await rmdir(path);
 			return true;
 		} catch {
 			return false;
@@ -1030,6 +1139,18 @@ function splitLines(text) {
 		.split(/\r?\n/)
 		.map((line) => line.trim())
 		.filter((line) => line !== '');
+}
+
+/**
+ * git's first error line, as one short sentence.
+ *
+ * The reason code is what the UI branches on; this is what the user reads next to
+ * it, so it is capped rather than allowed to paste a whole git diagnostic into a
+ * menu.
+ */
+function firstLine(text) {
+	const line = splitLines(text)[0] ?? '';
+	return line.length > DETAIL_MAX ? `${line.slice(0, DETAIL_MAX - 1)}…` : line;
 }
 
 /** `.git` as a directory or a file, or null when this directory has neither. */

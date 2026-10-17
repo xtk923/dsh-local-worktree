@@ -22,7 +22,7 @@ import { after, test } from 'node:test';
 
 import { createGitRunner } from '../src/git-runner.js';
 import { within } from '../src/git.js';
-import { GitFailure, Workspace } from '../src/workspace.js';
+import { GitFailure, Workspace, pathExists } from '../src/workspace.js';
 import { commit, fingerprint, git, gitSoft, makeRepo, oid, porcelain, removeAll, subjects, writeFile } from './fixture.mjs';
 import { join } from 'node:path';
 import { basename } from 'node:path';
@@ -587,6 +587,142 @@ test('a foreign branch name is never deleted by cleanup', async () => {
 	assert.equal(deleted, false);
 	const survives = await gitSoft(root, ['rev-parse', '--verify', '--quiet', 'refs/heads/feature/user-work']);
 	assert.equal(survives.exitCode, 0);
+});
+
+/**
+ * The Windows failure this plugin used to report as a bare "could not be removed":
+ * a process still holds the directory, git refuses its LAST step, and the hold is
+ * gone a moment later. The removal is retried, and the reason only retries a path
+ * that can become free — never a decision like "the tree is dirty".
+ */
+test('a removal that hits a busy path is retried, and succeeds once the hold clears', async () => {
+	const { root } = await repo({ name: 'busy-path' });
+	const created = await ws.create(root);
+
+	let busy = 2;
+	const flaky = async (args, options) => {
+		// `gitArgs` puts the base flags and `-C <cwd>` first, so the verb is found by
+		// membership rather than by position.
+		const isRemove = args.includes('worktree') && args.includes('remove');
+		if (isRemove && busy > 0) {
+			busy -= 1;
+			return { exitCode: 255, stdout: '', stderr: `error: failed to delete '${created.path}': Permission denied\n` };
+		}
+		return run(args, options);
+	};
+	const retrying = new Workspace(flaky, { sleep: async () => {} });
+	const result = await retrying.cleanup(root, { path: created.path, branch: created.branch });
+
+	assert.equal(result.ok, true);
+	assert.equal(result.removed, true);
+	const removal = result.steps.find((step) => step.id === 'remove');
+	assert.equal(removal.ok, true);
+	assert.equal(removal.attempts, 3, 'two refusals, then the attempt that worked');
+	assert.equal(await pathExists(created.path), false);
+});
+
+test('a refusal that is a decision is not retried', async () => {
+	const { root } = await repo({ name: 'dirty-no-retry' });
+	const created = await ws.create(root);
+	await writeFile(join(created.path, 'scratch.txt'), 'unsaved\n');
+
+	let removals = 0;
+	const counting = async (args, options) => {
+		if (args.includes('worktree') && args.includes('remove')) removals += 1;
+		return run(args, options);
+	};
+	const countingWs = new Workspace(counting, { sleep: async () => {} });
+	const result = await countingWs.cleanup(root, { path: created.path, branch: created.branch });
+
+	assert.equal(result.ok, false);
+	assert.equal(result.reason, 'worktree-dirty');
+	assert.equal(removals, 1, 'a dirty worktree is an answer, not a race');
+	assert.match(result.detail, /untracked files|modified/i, 'git\'s own line rides along');
+});
+
+/**
+ * What `git worktree remove` leaves behind when only its last step fails: every
+ * file deleted, the `.git` pointer deleted, the directory itself still there. It
+ * used to survive forever (a later `prune` even drops its metadata), which is how
+ * a repository collected empty worktree directories. It is reclaimed — but only
+ * when it holds no file at all.
+ */
+test('an empty shell left by a refused removal is reclaimed instead of staying forever', async () => {
+	const { readdir, rm } = await import('node:fs/promises');
+	const { root } = await repo({ name: 'shell' });
+	const created = await ws.create(root);
+
+	for (const name of await readdir(created.path)) await rm(join(created.path, name), { recursive: true, force: true });
+	assert.deepEqual(await readdir(created.path), [], 'the shell is empty, exactly as git leaves it');
+
+	const result = await ws.cleanup(root, { path: created.path, branch: created.branch });
+	assert.equal(result.ok, true);
+	assert.equal(result.removed, true);
+	assert.ok(result.steps.some((step) => step.id === 'reclaim' && step.ok === true), 'the shell was reclaimed');
+	assert.equal(await pathExists(created.path), false, 'the empty directory is gone');
+	assert.equal((await ws.listWorktrees(root)).length, 1, 'and its registration went with it');
+});
+
+test('a directory that still holds a file is never reclaimed, and the reason says why', async () => {
+	const { readdir, rm } = await import('node:fs/promises');
+	const { root } = await repo({ name: 'shell-full' });
+	const created = await ws.create(root);
+
+	for (const name of await readdir(created.path)) await rm(join(created.path, name), { recursive: true, force: true });
+	await writeFile(join(created.path, 'notes.txt'), 'mine\n');
+
+	const result = await ws.cleanup(root, { path: created.path, branch: created.branch });
+	assert.equal(result.ok, false);
+	assert.equal(result.removed, false);
+	assert.equal(result.reason, 'worktree-gone');
+	assert.match(result.detail, /cannot remove working tree/i, 'git\'s own line rides along');
+	assert.equal(await pathExists(join(created.path, 'notes.txt')), true, 'a file the user put there survives');
+});
+
+/**
+ * The real sequence, not a synthetic one: git empties the tree and refuses the
+ * directory; the NEXT attempt can only answer "not a working tree", which is the
+ * consequence. The cause must survive, and once the hold is gone the shell must be
+ * reclaimed rather than reported as a failed removal.
+ */
+test('the reason kept for a half-removed worktree is the cause, not the symptom', async () => {
+	const { readdir, rm } = await import('node:fs/promises');
+	const { root } = await repo({ name: 'busy-husk' });
+	const created = await ws.create(root);
+
+	let first = true;
+	const emptying = async (args, options) => {
+		if (first && args.includes('worktree') && args.includes('remove')) {
+			first = false;
+			// Exactly what git does before failing: delete every entry, keep the dir.
+			for (const name of await readdir(created.path)) await rm(join(created.path, name), { recursive: true, force: true });
+			return { exitCode: 255, stdout: '', stderr: `error: failed to delete '${created.path}': Permission denied\n` };
+		}
+		return run(args, options);
+	};
+	const halfRemoved = new Workspace(emptying, { sleep: async () => {} });
+	const result = await halfRemoved.cleanup(root, { path: created.path, branch: created.branch });
+
+	assert.equal(result.ok, true);
+	assert.equal(result.removed, true);
+	const removal = result.steps.find((step) => step.id === 'remove');
+	assert.equal(removal.reason, 'path-in-use', 'the cause, not "not a working tree"');
+	assert.match(removal.detail, /Permission denied/);
+	const reclaimed = result.steps.find((step) => step.id === 'reclaim');
+	assert.equal(reclaimed.reason, 'path-in-use');
+	assert.equal(await pathExists(created.path), false);
+});
+
+test('a locked worktree is refused with a reason a user can act on', async () => {
+	const { root } = await repo({ name: 'locked' });
+	const created = await ws.create(root);
+	await git(root, ['worktree', 'lock', created.path]);
+
+	const result = await ws.cleanup(root, { path: created.path, branch: created.branch });
+	assert.equal(result.ok, false);
+	assert.equal(result.removed, false);
+	assert.equal(result.reason, 'worktree-locked');
+	assert.equal(await pathExists(created.path), true);
 });
 
 /* ------------------------------------------------------------ drift/status -- */

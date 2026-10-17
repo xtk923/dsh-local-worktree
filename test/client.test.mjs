@@ -806,7 +806,18 @@ test('the menu entry for deliver asks the same question as the button', async ()
 		cwd: WORKTREE_PATH,
 		routes: {
 			[statusRoute(WORKTREE_PATH)]: READY_STATUS,
-			deliver: { ok: true, text: '已合并', cleanup: { removed: false, reason: 'git-error' } }
+			// A refusal: the host was asked to remove, git said no, and it says why.
+			deliver: {
+				ok: true,
+				text: '已合并',
+				cleanup: {
+					removed: false,
+					reason: 'path-in-use',
+					reasonText: '路径被占用或没有权限 / the path is in use or not writable',
+					detail: "error: failed to delete 'C:/w/wt': Permission denied",
+					hint: '先停掉占着它的进程再试 / stop the process holding it'
+				}
+			}
 		}
 	});
 
@@ -821,7 +832,14 @@ test('the menu entry for deliver asks the same question as the button', async ()
 	// A removal the host was ASKED for and git refused is not a choice to keep: the
 	// directory is still on disk, and saying "kept" would misreport that.
 	await harness.driver.click(itemsOf(harness.driver.tree)[0]);
-	assert.match(textOf(harness.driver.tree), /未能删除|could not be removed/);
+	const notice = textOf(harness.driver.tree);
+	assert.match(notice, /未能删除|could not be removed/);
+	// ...and it must carry WHY. This is the exact notice that used to stop at
+	// "could not be removed", leaving the user to find out by hand that a process
+	// was holding the directory.
+	assert.match(notice, /路径被占用|in use or not writable/, 'the reason the host computed is shown');
+	assert.match(notice, /Permission denied/, "git's own line is shown");
+	assert.match(notice, /停掉占着它的进程|stop the process holding it/, 'the hint is shown');
 });
 
 /* ------------------------------------- uncommitted work, said BEFORE the click -- */

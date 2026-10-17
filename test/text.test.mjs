@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { committedText, deliveredText, reasonText } from '../src/text.js';
+import { committedText, deliveredText, hintText, reasonText } from '../src/text.js';
 
 /** How many language separators a sentence has; more than one means nesting. */
 const separators = (text) => String(text).split(' / ').length - 1;
@@ -52,4 +52,17 @@ test('a reason can be read in one language without the other leaking in', () => 
 	// An unknown code is reported as itself rather than swallowed: a missing string is
 	// a bug, and seeing the code is how it gets noticed.
 	assert.equal(reasonText('no-such-reason'), 'no-such-reason');
+});
+
+test('only the failures that need advice carry a hint, and the busy-path one names --force', () => {
+	// The refusal this plugin shipped without an explanation: "could not be removed"
+	// with nothing after it. The hint is what makes the message actionable, and the
+	// `--force` sentence is the part that stops a user wasting a click on it.
+	const busy = hintText('path-in-use');
+	assert.equal(separators(busy), 1);
+	assert.match(busy, /--force/);
+	assert.match(hintText('worktree-locked'), /unlock/);
+	assert.equal(hintText('worktree-dirty'), '', 'a reason that speaks for itself gets no paragraph');
+	assert.equal(hintText('no-such-reason'), '');
+	assert.equal(hintText(undefined), '');
 });

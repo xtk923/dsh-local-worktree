@@ -896,11 +896,18 @@ export function classifyGitFailure({ stderr = '', stdout = '', exitCode = 1 } = 
 	// actionable answer is "commit or stash", not "the tree is dirty".
 	if (has(/would be overwritten|Please commit your changes or stash|Refusing to lose/i)) return 'local-changes-would-be-lost';
 	if (has(/contains modified or untracked files|is dirty/i)) return 'worktree-dirty';
+	// `git worktree lock` is a deliberate park, and removal refuses until it is
+	// lifted; saying so is the difference between "unlock it" and "try --force".
+	if (has(/is locked|locked working tree/i)) return 'worktree-locked';
 	if (has(/is already used by worktree|already exists/i)) return 'worktree-exists';
 	if (has(/not a git repository/i)) return 'not-a-repository';
 	if (has(/invalid reference|unknown revision|bad revision/i)) return 'bad-reference';
 	if (has(/unable to create directory|Permission denied|being used by another process|Access is denied/i)) return 'path-in-use';
-	if (has(/Invalid path|is outside repository|not a working tree/i)) return 'invalid-path';
+	// The worktree's `.git` pointer was deleted while the directory survived — git
+	// no longer manages this path at all. Naming it is what lets cleanup reclaim an
+	// empty shell instead of reporting an opaque failure.
+	if (has(/cannot remove working tree|is not a working tree/i)) return 'worktree-gone';
+	if (has(/Invalid path|is outside repository/i)) return 'invalid-path';
 	if (has(/cannot lock ref|Unable to create .*\.lock|index\.lock/i)) return 'locked';
 	if (has(/unrelated histories/i)) return 'unrelated-histories';
 	if (has(/hook declined|pre-commit|pre-merge-commit/i)) return 'hook-rejected';

@@ -32,7 +32,12 @@ export const REASONS = {
 	'main-dirty': BOTH('原工作区有未提交改动，先提交或 stash，再合并', 'the main tree has uncommitted changes — commit or stash them, then merge'),
 	'main-head-moved-refuse': BOTH('原分支已经被别人推进了，先同步再合并', 'the base branch moved — reconcile it before merging'),
 	'worktree-missing': BOTH('worktree 目录不在了', 'the worktree directory is gone'),
+	'worktree-gone': BOTH(
+		'这个 worktree 的 .git 指针已经不在了，git 不再把它当作工作树',
+		"the worktree's .git pointer is gone, so git no longer treats it as a working tree"
+	),
 	'worktree-dirty': BOTH('worktree 里有未提交改动', 'the worktree has uncommitted changes'),
+	'worktree-locked': BOTH('这个 worktree 被 git 锁住了，解锁后才能删', 'the worktree is locked with git, so it cannot be removed'),
 	'nothing-to-commit': BOTH('没有需要提交的改动', 'nothing to commit'),
 	'commit-failed': BOTH('提交失败', 'the commit failed'),
 	'worktree-conflicted': BOTH('worktree 里有一次没做完的合并', 'the worktree has an unfinished merge'),
@@ -96,6 +101,44 @@ export function reasonText(code, { lang = 'zh' } = {}) {
 /** Bilingual, always, for a place with room for one line. */
 export function bothText(code) {
 	return reasonText(code, { lang: 'both' });
+}
+
+/**
+ * What the user can still DO, for the failures where the reason alone is a dead
+ * end.
+ *
+ * Kept apart from {@link REASONS} on purpose: a reason says what happened, a hint
+ * says what to change. Only reasons whose next step is genuinely not obvious get
+ * one — a hint everywhere would turn every message into a paragraph.
+ */
+export const HINTS = {
+	// The Windows case this plugin kept mis-reporting as "kept": git deleted every
+	// file and then could not delete the directory itself, and `--force` does not
+	// help, because force skips the dirty-tree check rather than a live handle.
+	'path-in-use': BOTH(
+		'有进程正占着这个目录（在 worktree 里跑的 dev server、python、编辑器，或本会话自己），Windows 不允许删除正在使用的目录：先停掉它，再点一次。--force 只跳过「有未提交改动」的检查，删不掉被占用的目录',
+		'a live process still holds the directory (a dev server, python or an editor running in it, or this session itself) — Windows will not delete a directory that is in use. Stop it and try again; --force only bypasses the uncommitted-changes check, it cannot delete a busy directory'
+	),
+	// `git worktree lock` is what a tool that parks a worktree (or a person parking
+	// one) leaves behind; removal refuses until it is lifted, and no amount of
+	// `--force` (one) helps.
+	'worktree-locked': BOTH(
+		'先执行 `git worktree unlock <路径>` 解锁，再点一次；加一次 --force 也删不掉被锁的 worktree',
+		'run `git worktree unlock <path>` first, then try again — a single --force cannot remove a locked worktree'
+	),
+	// The shell `git worktree remove` leaves when it cannot delete the directory
+	// itself: git no longer manages the path, and only an empty one can be removed
+	// for the user.
+	'worktree-gone': BOTH(
+		'目录里还有文件，确认没用后手动删掉这个目录（空目录会被自动清理）',
+		'the directory still holds files — delete it by hand once you are sure it is not needed (an empty directory is cleaned up automatically)'
+	)
+};
+
+/** The advice for one reason code, or `''` when the reason speaks for itself. */
+export function hintText(code) {
+	if (typeof code !== 'string' || code === '') return '';
+	return HINTS[code] ?? '';
 }
 
 /** Where a created worktree lives, as a sentence. */

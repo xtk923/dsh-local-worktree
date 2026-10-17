@@ -1088,9 +1088,15 @@ window.__ModuleLoader__.load({
 			 * Three different outcomes, deliberately not one: the host reports
 			 * `cleanup: null` when removal was not asked for (kept on purpose), and a
 			 * `cleanup` object whose `removed` is false when removal WAS asked for and
-			 * git refused it (a dirty worktree, a locked repository). Calling the
-			 * second one "kept" would tell the user their choice was honoured when the
-			 * directory is still on disk.
+			 * git refused it (a busy path, a locked repository). Calling the second one
+			 * "kept" would tell the user their choice was honoured when the directory is
+			 * still on disk.
+			 *
+			 * A refusal carries WHY, and the reason is printed. It used to be dropped
+			 * here, which made "worktree 未能删除" the whole story of a directory the
+			 * user then had to clean up by hand: the host already knew it was a
+			 * `path-in-use` (on Windows, a live process holding the directory) and the
+			 * person reading the notice did not.
 			 */
 			const deliverNotice = React.useCallback((answer) => {
 				const text = answer.text || '已合并 / merged';
@@ -1100,7 +1106,11 @@ window.__ModuleLoader__.load({
 				if (answer.cleanup.removed === true) {
 					return `${text}，worktree 已删除 / the worktree was removed`;
 				}
-				return `${text}，worktree 未能删除，已保留 / the worktree could not be removed and was kept`;
+				const why = [answer.cleanup.reasonText, answer.cleanup.detail]
+					.filter((part) => typeof part === 'string' && part !== '')
+					.join('：');
+				const hint = typeof answer.cleanup.hint === 'string' && answer.cleanup.hint !== '' ? `\n${answer.cleanup.hint}` : '';
+				return `${text}，worktree 未能删除${why === '' ? '' : `（${why}）`}，已保留 / the worktree could not be removed and was kept${hint}`;
 			}, []);
 
 			/**

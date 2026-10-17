@@ -486,6 +486,32 @@ test('the whole journey through the routes: create, status, deliver', async () =
 	assert.ok(listed.includes(again.body.created.path.replace(/\\/g, '/')), 'the untouched worktree was kept');
 });
 
+test('a worktree git refused to remove comes back with the reason git gave', async () => {
+	const root = await makeRepo({ name: 'impl-refused-cleanup' });
+	const harness = await mount();
+	const created = await call(harness, ROUTES.create, { method: 'POST', body: { cwd: root } });
+	const wt = created.body.created.path;
+
+	await writeFile(join(wt, 'feature.txt'), 'delivered\n');
+	await git(wt, ['add', '-A']);
+	await commit(wt, 'a feature worth keeping');
+	// `git worktree lock` is a refusal the plugin cannot retry away: the merge must
+	// still succeed, and the answer must SAY what to lift.
+	await git(root, ['worktree', 'lock', wt]);
+
+	const delivered = await call(harness, ROUTES.deliver, { method: 'POST', body: { cwd: wt } });
+	assert.equal(delivered.body.ok, true, 'the merge itself still happened');
+	assert.equal(delivered.body.cleanup.removed, false);
+	assert.equal(delivered.body.cleanup.reason, 'worktree-locked');
+	// The three pieces the button now prints: the code, the sentence, and git's own
+	// line. Before this, `removed: false` was the whole answer.
+	assert.match(delivered.body.cleanup.reasonText, /被 git 锁住|locked with git/);
+	assert.match(delivered.body.cleanup.detail, /locked/i, "git's own line rides along");
+	assert.match(delivered.body.cleanup.hint, /unlock/i, 'and the fix is stated');
+
+	await git(root, ['worktree', 'unlock', wt]);
+});
+
 test('a session already inside a worktree is not offered another one', async () => {
 	const root = await makeRepo({ name: 'impl-inside-gate' });
 	const harness = await mount();
